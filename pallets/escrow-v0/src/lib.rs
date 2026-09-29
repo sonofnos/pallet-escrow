@@ -128,7 +128,7 @@ pub mod pallet {
 				Fortitude::Polite,
 			)?;
 			escrow.released += 1;
-			escrow.remaining = escrow.remaining - amount;
+			escrow.remaining -= amount;
 			Escrows::<T>::insert(id, escrow);
 			Self::deposit_event(Event::Released { id, amount });
 			Ok(())
