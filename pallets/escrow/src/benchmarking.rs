@@ -3,7 +3,10 @@
 use super::*;
 use crate::pallet::{BalanceOf, EscrowId, Escrows, NextEscrowId};
 use frame_benchmarking::v2::*;
-use frame_support::{traits::fungible::Mutate, BoundedVec};
+use frame_support::{
+	traits::{fungible::Mutate, Get},
+	BoundedVec,
+};
 use frame_system::RawOrigin;
 use sp_runtime::traits::{Bounded, Saturating};
 

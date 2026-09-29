@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 arbitrary = { workspace = true }
 codec = { workspace = true, features = ["std"] }
+scale-info = { workspace = true, features = ["std"] }
 frame-support = { workspace = true, features = ["std"] }
 frame-system = { workspace = true, features = ["std"] }
 pallet-balances = { workspace = true, features = ["std"] }
@@ -18,3 +19,8 @@ sp-io = { workspace = true, features = ["std"] }
 sp-runtime = { workspace = true, features = ["std"] }
 pallet-escrow = { workspace = true, features = ["std", "try-runtime"] }
 pallet-escrow-v0 = { workspace = true, features = ["std"] }
+
+[features]
+# `construct_runtime!` emits `std`-gated code; the harness always runs natively.
+default = ["std"]
+std = []
