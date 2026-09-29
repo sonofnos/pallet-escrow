@@ -1,0 +1,28 @@
+[package]
+name = "escrow-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+escrow-harness = { path = "../harness" }
+
+[[bin]]
+name = "escrow"
+path = "fuzz_targets/escrow.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "escrow_v0"
+path = "fuzz_targets/escrow_v0.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

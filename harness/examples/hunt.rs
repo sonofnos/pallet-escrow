@@ -1,0 +1,32 @@
+//! Print every class of spec violation the harness finds, with a shrunk reproduction.
+//!
+//! cargo run --release -p escrow-harness --example hunt -- v0 20000
+
+use escrow_harness::{
+	hunt, quiet_panics,
+	runtimes::{fixed::Fixed, v0::V0},
+	Finding,
+};
+
+fn main() {
+	let mut args = std::env::args().skip(1);
+	let target = args.next().unwrap_or_else(|| "v0".into());
+	let seeds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(10_000);
+	quiet_panics();
+
+	let findings: Vec<Finding> = match target.as_str() {
+		"v0" => hunt::<V0>(seeds),
+		"fixed" => hunt::<Fixed>(seeds),
+		other => panic!("unknown target {other}, use v0 or fixed"),
+	};
+
+	println!("{target}: {seeds} seeded sequences, {} violation classes\n", findings.len());
+	for f in &findings {
+		println!("## {}\nfirst seed {}, {} sequences hit it", f.label, f.seed, f.hits);
+		println!("shrunk to {} calls:", f.reproduction.len());
+		for a in &f.reproduction {
+			println!("  {a:?}");
+		}
+		println!("{}\n", f.violation);
+	}
+}

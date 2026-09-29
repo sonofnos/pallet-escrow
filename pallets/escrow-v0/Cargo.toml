@@ -1,0 +1,26 @@
+[package]
+name = "pallet-escrow-v0"
+version = "0.0.1"
+description = "AUDIT TARGET. The first draft of pallet-escrow, kept unfixed so the audit findings stay reproducible. Never deploy."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true }
+scale-info = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+sp-runtime = { workspace = true }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"scale-info/std",
+	"frame-support/std",
+	"frame-system/std",
+	"sp-runtime/std",
+]

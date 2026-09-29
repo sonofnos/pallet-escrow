@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = ["pallets/escrow", "pallets/escrow-v0", "harness"]
+exclude = ["fuzz"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Christian Emeka <christian@sonofnos.com>"]
+repository = "https://github.com/sonofnos/pallet-escrow"
+
+# Polkadot SDK stable2606 line.
+[workspace.dependencies]
+codec = { package = "parity-scale-codec", version = "3.7.5", default-features = false, features = ["derive"] }
+scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
+frame-support = { version = "48.0.0", default-features = false }
+frame-system = { version = "48.0.0", default-features = false }
+frame-benchmarking = { version = "49.0.0", default-features = false }
+pallet-balances = { version = "50.0.0", default-features = false }
+sp-core = { version = "43.0.0", default-features = false }
+sp-io = { version = "48.0.0", default-features = false }
+sp-runtime = { version = "48.0.0", default-features = false }
+arbitrary = { version = "1.3", features = ["derive"] }
+
+pallet-escrow = { path = "pallets/escrow", default-features = false }
+pallet-escrow-v0 = { path = "pallets/escrow-v0", default-features = false }

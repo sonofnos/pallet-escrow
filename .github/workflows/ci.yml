@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - name: Unit tests
+        run: cargo test -p pallet-escrow
+      - name: Benchmarks execute
+        run: cargo test -p pallet-escrow --features runtime-benchmarks
+      - name: Spec-oracle harness (fixed must pass, v0 findings must be rediscovered)
+        run: cargo test -p escrow-harness --release -- --nocapture
+        env:
+          # Keep debug assertions on so arithmetic overflow panics instead of wrapping.
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+          HARNESS_SEEDS: "20000"
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --features pallet-escrow/runtime-benchmarks -- -D warnings
+
+  hunt-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: v0 with overflow checks (how tests see it)
+        run: |
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS=true \
+            cargo run --release -q -p escrow-harness --example hunt -- v0 20000 | tee hunt-v0-checked.txt
+      - name: v0 as a production runtime runs it (overflow wraps)
+        run: cargo run --release -q -p escrow-harness --example hunt -- v0 20000 | tee hunt-v0-wrapping.txt
+      - name: fixed
+        run: cargo run --release -q -p escrow-harness --example hunt -- fixed 50000 | tee hunt-fixed.txt
+      - run: |
+          { echo '```'; cat hunt-v0-checked.txt; echo '```'; echo '```'; head -40 hunt-v0-wrapping.txt; echo '```'; echo '```'; cat hunt-fixed.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hunt-reports
+          path: hunt-*.txt
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz hardened pallet (must not crash)
+        run: cd fuzz && cargo fuzz run escrow -- -max_total_time=300 -max_len=4096
+      - name: Fuzz v0 (must crash)
+        run: |
+          set -o pipefail
+          cd fuzz
+          if cargo fuzz run escrow_v0 -- -max_total_time=120 -max_len=4096 2>&1 | tee v0.log; then
+            echo "expected libFuzzer to find a violation in v0"; exit 1
+          fi
+          grep -m1 -A3 "panicked" v0.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Pallet builds for the runtime target without std
+        run: cargo check -p pallet-escrow --no-default-features --target wasm32v1-none

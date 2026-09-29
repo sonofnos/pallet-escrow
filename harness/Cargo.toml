@@ -1,0 +1,20 @@
+[package]
+name = "escrow-harness"
+version = "0.1.0"
+description = "Spec-oracle harness: drives random call sequences at an escrow pallet and checks every outcome against the written spec."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+arbitrary = { workspace = true }
+codec = { workspace = true, features = ["std"] }
+frame-support = { workspace = true, features = ["std"] }
+frame-system = { workspace = true, features = ["std"] }
+pallet-balances = { workspace = true, features = ["std"] }
+sp-io = { workspace = true, features = ["std"] }
+sp-runtime = { workspace = true, features = ["std"] }
+pallet-escrow = { workspace = true, features = ["std", "try-runtime"] }
+pallet-escrow-v0 = { workspace = true, features = ["std"] }

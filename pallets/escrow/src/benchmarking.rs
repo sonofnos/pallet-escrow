@@ -1,0 +1,95 @@
+//! Benchmarks for `pallet_escrow`. Every call is measured at its worst case.
+
+use super::*;
+use crate::pallet::{BalanceOf, EscrowId, Escrows, NextEscrowId};
+use frame_benchmarking::v2::*;
+use frame_support::{traits::fungible::Mutate, BoundedVec};
+use frame_system::RawOrigin;
+use sp_runtime::traits::{Bounded, Saturating};
+
+fn funded<T: Config>(name: &'static str, index: u32) -> T::AccountId {
+	let who: T::AccountId = account(name, index, 0);
+	// An eighth of the maximum each, so funding every party cannot overflow total issuance.
+	let amount = BalanceOf::<T>::max_value() / 8u32.into();
+	T::Currency::set_balance(&who, amount);
+	who
+}
+
+fn milestones<T: Config>(count: u32) -> BoundedVec<BalanceOf<T>, T::MaxMilestones> {
+	let amount = T::MinMilestone::get().saturating_mul(10u32.into());
+	let mut out = BoundedVec::new();
+	for _ in 0..count {
+		out.try_push(amount).expect("count is at most MaxMilestones");
+	}
+	out
+}
+
+/// Open an escrow with two milestones and return its id plus the parties.
+fn open<T: Config>() -> (EscrowId, T::AccountId, T::AccountId, T::AccountId) {
+	let payer = funded::<T>("payer", 0);
+	let beneficiary = funded::<T>("beneficiary", 0);
+	let arbiter = funded::<T>("arbiter", 0);
+	let id = NextEscrowId::<T>::get();
+	Pallet::<T>::create(
+		RawOrigin::Signed(payer.clone()).into(),
+		beneficiary.clone(),
+		Some(arbiter.clone()),
+		milestones::<T>(2),
+		frame_system::Pallet::<T>::block_number().saturating_add(10u32.into()),
+	)
+	.expect("benchmark escrow opens");
+	(id, payer, beneficiary, arbiter)
+}
+
+#[benchmarks]
+mod benchmarks {
+	use super::*;
+
+	#[benchmark]
+	fn create(m: Linear<1, { T::MaxMilestones::get() }>) {
+		let payer = funded::<T>("payer", 0);
+		let beneficiary = funded::<T>("beneficiary", 0);
+		let arbiter = funded::<T>("arbiter", 0);
+		let deadline = frame_system::Pallet::<T>::block_number().saturating_add(10u32.into());
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(payer), beneficiary, Some(arbiter), milestones::<T>(m), deadline);
+
+		assert!(Escrows::<T>::contains_key(0));
+	}
+
+	// Worst case: the final milestone, which also closes the escrow.
+	#[benchmark]
+	fn release() {
+		let (id, payer, ..) = open::<T>();
+		Pallet::<T>::release(RawOrigin::Signed(payer.clone()).into(), id)
+			.expect("first milestone releases");
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(payer), id);
+
+		assert!(!Escrows::<T>::contains_key(id));
+	}
+
+	#[benchmark]
+	fn refund() {
+		let (id, _, _, arbiter) = open::<T>();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(arbiter), id);
+
+		assert!(!Escrows::<T>::contains_key(id));
+	}
+
+	#[benchmark]
+	fn cancel() {
+		let (id, _, beneficiary, _) = open::<T>();
+
+		#[extrinsic_call]
+		_(RawOrigin::Signed(beneficiary), id);
+
+		assert!(!Escrows::<T>::contains_key(id));
+	}
+
+	impl_benchmark_test_suite!(Pallet, crate::mock::new_test_ext(), crate::mock::Test);
+}
