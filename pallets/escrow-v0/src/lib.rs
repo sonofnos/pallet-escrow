@@ -44,7 +44,7 @@ pub mod pallet {
 		type RuntimeHoldReason: From<HoldReason>;
 	}
 
-	#[derive(Encode, Decode, Clone, PartialEq, Eq, RuntimeDebug, TypeInfo)]
+	#[derive(Encode, Decode, Clone, PartialEq, Eq, Debug, TypeInfo)]
 	pub struct EscrowInfo<AccountId, Balance, BlockNumber> {
 		pub payer: AccountId,
 		pub beneficiary: AccountId,

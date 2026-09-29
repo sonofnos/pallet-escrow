@@ -45,7 +45,7 @@ pub mod pallet {
 			fungible::{Inspect, InspectHold, Mutate, MutateHold},
 			tokens::{Fortitude, Precision, Restriction},
 		},
-		CloneNoBound, EqNoBound, PartialEqNoBound, RuntimeDebugNoBound,
+		CloneNoBound, DebugNoBound, EqNoBound, PartialEqNoBound,
 	};
 	use frame_system::pallet_prelude::*;
 	use sp_runtime::traits::{CheckedAdd, CheckedSub, Zero};
@@ -100,7 +100,7 @@ pub mod pallet {
 		CloneNoBound,
 		PartialEqNoBound,
 		EqNoBound,
-		RuntimeDebugNoBound,
+		DebugNoBound,
 		TypeInfo,
 		MaxEncodedLen,
 	)]
