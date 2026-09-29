@@ -10,7 +10,9 @@ fn seeds(default: u64) -> u64 {
 #[test]
 fn hardened_pallet_never_violates_the_spec() {
 	quiet_panics();
+	escrow_harness::spec::reset_coverage();
 	let findings = hunt::<Fixed>(seeds(4_000));
+	eprintln!("pallet-escrow calls:\n{}", escrow_harness::spec::coverage());
 	for f in &findings {
 		eprintln!(
 			"{} (seed {}, {} hits)\n  {}\n  repro: {:?}",

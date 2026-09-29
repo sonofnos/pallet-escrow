@@ -20,7 +20,8 @@ fn main() {
 		other => panic!("unknown target {other}, use v0 or fixed"),
 	};
 
-	println!("{target}: {seeds} seeded sequences, {} violation classes\n", findings.len());
+	println!("{target}: {seeds} seeded sequences, {} violation classes", findings.len());
+	println!("calls (including shrinking):\n{}\n", escrow_harness::spec::coverage());
 	for f in &findings {
 		println!("## {}\nfirst seed {}, {} sequences hit it", f.label, f.seed, f.hits);
 		println!("shrunk to {} calls:", f.reproduction.len());

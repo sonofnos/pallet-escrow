@@ -15,7 +15,38 @@ use std::{
 	collections::BTreeMap,
 	fmt,
 	panic::{catch_unwind, AssertUnwindSafe},
+	sync::atomic::{AtomicU64, Ordering},
 };
+
+/// Calls executed, as `[ok, err]` for create, release, refund, cancel. Reported next to the
+/// results so a clean run can be told apart from a run that never reached deep states.
+static CALLS: [[AtomicU64; 2]; 4] = [
+	[AtomicU64::new(0), AtomicU64::new(0)],
+	[AtomicU64::new(0), AtomicU64::new(0)],
+	[AtomicU64::new(0), AtomicU64::new(0)],
+	[AtomicU64::new(0), AtomicU64::new(0)],
+];
+
+/// Reset the call counters.
+pub fn reset_coverage() {
+	CALLS.iter().flatten().for_each(|c| c.store(0, Ordering::Relaxed));
+}
+
+/// One line per call kind: how many succeeded and how many were rejected.
+pub fn coverage() -> String {
+	["create", "release", "refund", "cancel"]
+		.iter()
+		.zip(CALLS.iter())
+		.map(|(name, [ok, err])| {
+			format!(
+				"{name:<8} ok {:>8}  rejected {:>8}",
+				ok.load(Ordering::Relaxed),
+				err.load(Ordering::Relaxed)
+			)
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+}
 
 use crate::runtimes::ACCOUNTS;
 
@@ -56,18 +87,22 @@ pub trait Target {
 	}
 }
 
-/// Milestone amounts: mostly realistic, sometimes close to `u64::MAX` to reach overflow.
+/// A milestone amount: usually realistic, about 3% of the time close to `u64::MAX` so that
+/// overflow is reachable without drowning every sequence in it.
 #[derive(Arbitrary, Clone, Copy, Debug)]
-pub enum Amount {
-	Small(u16),
-	Huge(u16),
+pub struct Amount {
+	pub value: u16,
+	pub huge: u8,
 }
 
 impl Amount {
-	fn value(self) -> u64 {
-		match self {
-			Amount::Small(v) => u64::from(v % 3_000),
-			Amount::Huge(v) => u64::MAX - u64::from(v),
+	fn value(self, well_formed: bool, min: u64) -> u64 {
+		if self.huge < 8 {
+			u64::MAX - u64::from(self.value)
+		} else if well_formed {
+			min + u64::from(self.value) % 1_500
+		} else {
+			u64::from(self.value % 3_000)
 		}
 	}
 }
@@ -81,6 +116,9 @@ pub enum Action {
 		arbiter: Option<u8>,
 		milestones: Vec<Amount>,
 		deadline_in: u8,
+		/// Three in four creates are well formed, so sequences reach deep states instead of
+		/// stopping at input validation; the rest take the raw values.
+		shape: u8,
 	},
 	Release {
 		who: u8,
@@ -101,6 +139,23 @@ pub enum Action {
 
 fn account(index: u8) -> u64 {
 	u64::from(index) % ACCOUNTS + 1
+}
+
+/// An account other than `base`, chosen by `n`.
+fn other_account(base: u64, n: u8) -> u64 {
+	(base + u64::from(n) % (ACCOUNTS - 1)) % ACCOUNTS + 1
+}
+
+/// Pick a caller by role in the escrow, so authorised and unauthorised calls both happen often.
+fn caller(who: u8, parties: Option<&(u64, u64, Option<u64>)>) -> u64 {
+	match (parties, who % 6) {
+		(Some((payer, _, _)), 0 | 1) => *payer,
+		(Some((_, beneficiary, _)), 2) => *beneficiary,
+		(Some((payer, beneficiary, arbiter)), 3) => arbiter.unwrap_or_else(|| {
+			(1..=ACCOUNTS).find(|a| a != payer && a != beneficiary).unwrap_or(1)
+		}),
+		_ => account(who / 6),
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,6 +270,8 @@ impl Effect {
 struct Model {
 	escrows: BTreeMap<u32, ModelEscrow>,
 	next_id: u32,
+	/// Parties of every escrow ever created, live or closed.
+	parties: BTreeMap<u32, (u64, u64, Option<u64>)>,
 }
 
 impl Model {
@@ -306,6 +363,7 @@ impl Model {
 						deadline: *deadline,
 					},
 				);
+				self.parties.insert(self.next_id, (*payer, *beneficiary, *arbiter));
 				self.next_id += 1;
 			},
 			Call::Release { id, .. } => {
@@ -378,28 +436,53 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 					T::set_block(block + u64::from(blocks));
 					continue;
 				},
-				Action::Create { payer, beneficiary, arbiter, milestones, deadline_in } => {
-					Call::Create {
-						payer: account(payer),
-						beneficiary: account(beneficiary),
-						arbiter: arbiter.map(account),
-						milestones: milestones
-							.iter()
-							.take(MAX_MILESTONES_GENERATED)
-							.map(|m| m.value())
-							.collect(),
-						// Spans a little into the past so past deadlines are exercised too.
-						deadline: (block + u64::from(deadline_in % 24)).saturating_sub(2),
+				Action::Create { payer, beneficiary, arbiter, milestones, deadline_in, shape } => {
+					let well_formed = shape % 4 != 0;
+					let min = T::PARAMS.min_milestone;
+					let payer = account(payer);
+					let mut amounts: Vec<u64> = milestones
+						.iter()
+						.take(MAX_MILESTONES_GENERATED)
+						.map(|m| m.value(well_formed, min))
+						.collect();
+					if well_formed {
+						let beneficiary = other_account(payer, beneficiary);
+						amounts.truncate(T::PARAMS.max_milestones);
+						if amounts.is_empty() {
+							amounts.push(min);
+						}
+						let third_parties: Vec<u64> =
+							(1..=ACCOUNTS).filter(|x| *x != payer && *x != beneficiary).collect();
+						Call::Create {
+							payer,
+							beneficiary,
+							arbiter: arbiter
+								.map(|a| third_parties[usize::from(a) % third_parties.len()]),
+							milestones: amounts,
+							deadline: block + 1 + u64::from(deadline_in % 20),
+						}
+					} else {
+						Call::Create {
+							payer,
+							beneficiary: account(beneficiary),
+							arbiter: arbiter.map(account),
+							milestones: amounts,
+							// Spans a little into the past so past deadlines are exercised too.
+							deadline: (block + u64::from(deadline_in % 24)).saturating_sub(2),
+						}
 					}
 				},
 				Action::Release { who, id } => {
-					Call::Release { who: account(who), id: u32::from(id) % span }
+					let id = u32::from(id) % span;
+					Call::Release { who: caller(who, model.parties.get(&id)), id }
 				},
 				Action::Refund { who, id } => {
-					Call::Refund { who: account(who), id: u32::from(id) % span }
+					let id = u32::from(id) % span;
+					Call::Refund { who: caller(who, model.parties.get(&id)), id }
 				},
 				Action::Cancel { who, id } => {
-					Call::Cancel { who: account(who), id: u32::from(id) % span }
+					let id = u32::from(id) % span;
+					Call::Cancel { who: caller(who, model.parties.get(&id)), id }
 				},
 			};
 
@@ -423,6 +506,13 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 				},
 			};
 			let after = snapshot::<T>();
+			let kind = match call {
+				Call::Create { .. } => 0,
+				Call::Release { .. } => 1,
+				Call::Refund { .. } => 2,
+				Call::Cancel { .. } => 3,
+			};
+			CALLS[kind][usize::from(outcome.is_err())].fetch_add(1, Ordering::Relaxed);
 
 			match outcome {
 				Err(err) => {
