@@ -47,12 +47,16 @@ jobs:
         run: cargo run --release -q -p escrow-harness --example hunt -- v0 20000 | tee hunt-v0-wrapping.txt
       - name: fixed
         run: cargo run --release -q -p escrow-harness --example hunt -- fixed 50000 | tee hunt-fixed.txt
+      - name: Proofs of concept (release build, as a runtime is built)
+        run: cargo run --release -q -p escrow-harness --example poc | tee poc.txt
       - run: |
-          { echo '```'; cat hunt-v0-checked.txt; echo '```'; echo '```'; head -40 hunt-v0-wrapping.txt; echo '```'; echo '```'; cat hunt-fixed.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; cat poc.txt; echo '```'; echo '```'; cat hunt-v0-checked.txt; echo '```'; echo '```'; head -40 hunt-v0-wrapping.txt; echo '```'; echo '```'; cat hunt-fixed.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: hunt-reports
-          path: hunt-*.txt
+          path: |
+            hunt-*.txt
+            poc.txt
 
   fuzz:
     runs-on: ubuntu-latest
