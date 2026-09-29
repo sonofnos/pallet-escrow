@@ -100,7 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo install --git https://github.com/sonofnos/frame-sentinel --locked
+      - run: cargo install --git https://github.com/sonofnos/frame-sentinel
       - name: Hardened pallet must have no findings at medium or above
         run: frame-sentinel pallets/escrow --fail-on medium
       - name: Audit target (report only)
