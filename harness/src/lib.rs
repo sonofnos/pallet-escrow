@@ -24,12 +24,30 @@ impl SplitMix {
 	}
 }
 
+/// Decode actions until the bytes run out, up to [`spec::MAX_ACTIONS`].
+///
+/// `Vec::<Action>::arbitrary` continues on a coin flip per element, which gives sequences of
+/// about two calls on random input: far too short to reach a released-then-cancelled escrow.
+pub fn actions_from_bytes(data: &[u8]) -> Vec<Action> {
+	let mut u = Unstructured::new(data);
+	let mut actions = Vec::new();
+	while actions.len() < spec::MAX_ACTIONS {
+		match Action::arbitrary(&mut u) {
+			Ok(a) if !u.is_empty() => actions.push(a),
+			_ => break,
+		}
+	}
+	actions
+}
+
 /// The call sequence for a seed. Same seed, same sequence, on every machine.
 pub fn actions_for_seed(seed: u64) -> Vec<Action> {
 	let mut rng = SplitMix(seed);
-	let bytes: Vec<u8> = (0..1024).flat_map(|_| rng.next().to_le_bytes()).collect();
-	let mut u = Unstructured::new(&bytes);
-	Vec::<Action>::arbitrary(&mut u).unwrap_or_default()
+	let len = 8 + (rng.next() % 41) as usize;
+	let bytes: Vec<u8> = (0..len * 3).flat_map(|_| rng.next().to_le_bytes()).collect();
+	let mut actions = actions_from_bytes(&bytes);
+	actions.truncate(len);
+	actions
 }
 
 /// The first, shrunk, reproduction of one class of bug.

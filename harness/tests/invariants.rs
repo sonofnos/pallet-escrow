@@ -26,7 +26,9 @@ fn hardened_pallet_never_violates_the_spec() {
 #[test]
 fn harness_rediscovers_the_v0_audit_findings() {
 	quiet_panics();
+	escrow_harness::spec::reset_coverage();
 	let findings = hunt::<V0>(seeds(4_000));
+	eprintln!("pallet-escrow-v0 calls:\n{}", escrow_harness::spec::coverage());
 	let labels: Vec<&str> = findings.iter().map(|f| f.label.as_str()).collect();
 	for f in &findings {
 		eprintln!(
@@ -38,21 +40,34 @@ fn harness_rediscovers_the_v0_audit_findings() {
 		);
 	}
 
-	let expected = [
-		// ESC-01: the arbiter's refund lands in the arbiter's account.
-		"refund: balances moved differently from spec",
-		// ESC-02: a cancelled escrow stays live, so it can be cancelled or released again.
-		"cancel: succeeded but no live escrow",
-		// ESC-03: milestone total overflows (a wrap in release builds).
-		"create: arithmetic overflow panic",
-		// ESC-04: anyone can release.
-		"release: succeeded but caller may not release",
-		// ESC-05: the payer can take the money back early.
-		"refund: succeeded but payer refunded before the deadline",
-		// ESC-06: panics on a missing id and after the last milestone.
-		"release: unwrap on missing escrow panic",
-		"release: index out of bounds panic",
+	// Each audit finding, and the labels under which the harness can surface it. A sequence
+	// stops at its first violation, so a finding can show up through any of its consequences.
+	let expected: [(&str, &[&str]); 7] = [
+		(
+			"ESC-01 arbiter refund pays the arbiter",
+			&["refund: balances moved differently from spec"],
+		),
+		(
+			"ESC-02 cancelled escrow stays live",
+			&[
+				"cancel: succeeded but no live escrow",
+				"release: succeeded but no live escrow",
+				"refund: succeeded but no live escrow",
+			],
+		),
+		("ESC-03 milestone total overflows", &["create: arithmetic overflow panic"]),
+		("ESC-04 anyone can release", &["release: succeeded but caller may not release"]),
+		(
+			"ESC-05 payer refunds before the deadline",
+			&["refund: succeeded but payer refunded before the deadline"],
+		),
+		("ESC-06a panic on unknown id", &["release: unwrap on missing escrow panic"]),
+		("ESC-06b panic after the last milestone", &["release: index out of bounds panic"]),
 	];
-	let missing: Vec<_> = expected.iter().filter(|e| !labels.contains(e)).collect();
+	let missing: Vec<&str> = expected
+		.iter()
+		.filter(|(_, alternatives)| !alternatives.iter().any(|a| labels.contains(a)))
+		.map(|(finding, _)| *finding)
+		.collect();
 	assert!(missing.is_empty(), "harness missed: {missing:?}\nfound: {labels:#?}");
 }
