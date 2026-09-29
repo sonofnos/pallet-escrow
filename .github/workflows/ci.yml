@@ -24,7 +24,7 @@ jobs:
       - name: Benchmarks execute
         run: cargo test -p pallet-escrow --features runtime-benchmarks
       - name: Spec-oracle harness (fixed must pass, v0 findings must be rediscovered)
-        run: cargo test -p escrow-harness --release -- --nocapture
+        run: cargo test -p escrow-harness --release -- --nocapture --test-threads=1
         env:
           # Keep debug assertions on so arithmetic overflow panics instead of wrapping.
           CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
