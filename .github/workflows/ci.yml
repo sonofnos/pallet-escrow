@@ -94,3 +94,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Pallet builds for the runtime target without std
         run: cargo check -p pallet-escrow --no-default-features --target wasm32v1-none
+
+  frame-sentinel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --git https://github.com/sonofnos/frame-sentinel --locked
+      - name: Hardened pallet must have no findings at medium or above
+        run: frame-sentinel pallets/escrow --fail-on medium
+      - name: Audit target (report only)
+        run: frame-sentinel pallets/escrow-v0 --fail-on never | tee -a "$GITHUB_STEP_SUMMARY"
