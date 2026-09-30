@@ -1,10 +1,13 @@
 //! One mock runtime per pallet under test, both behind the same [`Target`] interface.
 
-use crate::spec::{SpecParams, Target};
+use crate::spec::{Record, SpecEvent, SpecParams, Target, UNDECODABLE};
 use sp_runtime::DispatchResult;
+use std::collections::BTreeMap;
 
 pub const ACCOUNTS: u64 = 5;
 pub const START_BALANCE: u64 = 10_000;
+/// `pallet_balances::config_preludes::TestDefaultConfig::ExistentialDeposit`.
+pub const EXISTENTIAL_DEPOSIT: u64 = 1;
 
 fn genesis_balances() -> Vec<(u64, u64)> {
 	(1..=ACCOUNTS).map(|who| (who, START_BALANCE)).collect()
@@ -66,6 +69,7 @@ pub mod fixed {
 			min_milestone: MIN_MILESTONE,
 			deposit: DEPOSIT,
 			max_milestones: MAX_MILESTONES as usize,
+			existential_deposit: EXISTENTIAL_DEPOSIT,
 		};
 
 		fn new_ext() -> sp_io::TestExternalities {
@@ -91,9 +95,8 @@ pub mod fixed {
 		) -> DispatchResult {
 			// An oversized vector never decodes into a `BoundedVec` call argument, so the call
 			// could not reach the pallet at all.
-			let milestones: BoundedVec<u64, ConstU32<MAX_MILESTONES>> = milestones
-				.try_into()
-				.map_err(|_| DispatchError::Other("call does not decode: too many milestones"))?;
+			let milestones: BoundedVec<u64, ConstU32<MAX_MILESTONES>> =
+				milestones.try_into().map_err(|_| DispatchError::Other(UNDECODABLE))?;
 			Escrow::create(RuntimeOrigin::signed(payer), beneficiary, arbiter, milestones, deadline)
 		}
 		fn release(who: u64, id: u32) -> DispatchResult {
@@ -125,6 +128,45 @@ pub mod fixed {
 		}
 		fn next_id() -> u32 {
 			pallet_escrow::NextEscrowId::<Runtime>::get()
+		}
+		fn escrows() -> BTreeMap<u32, Record> {
+			pallet_escrow::Escrows::<Runtime>::iter()
+				.map(|(id, e)| {
+					let record = Record {
+						payer: e.payer,
+						beneficiary: e.beneficiary,
+						arbiter: e.arbiter,
+						milestones: e.milestones.into_inner(),
+						released: e.released,
+						remaining: e.remaining,
+						deposit: e.deposit,
+						deadline: e.deadline,
+					};
+					(id, record)
+				})
+				.collect()
+		}
+		fn events() -> Option<Vec<SpecEvent>> {
+			use pallet_escrow::Event as E;
+			let events = System::events().into_iter().filter_map(|r| match r.event {
+				RuntimeEvent::Escrow(e) => Some(match e {
+					E::Created { id, payer, beneficiary, total } => {
+						SpecEvent::Created { id, payer, beneficiary, total }
+					},
+					E::MilestoneReleased { id, index, amount } => {
+						SpecEvent::MilestoneReleased { id, index, amount }
+					},
+					E::Completed { id } => SpecEvent::Completed { id },
+					E::Refunded { id, amount } => SpecEvent::Refunded { id, amount },
+					E::Cancelled { id, amount } => SpecEvent::Cancelled { id, amount },
+					E::__Ignore(..) => unreachable!("never constructed"),
+				}),
+				_ => None,
+			});
+			Some(events.collect())
+		}
+		fn reset_events() {
+			System::reset_events()
 		}
 		fn try_state() -> Result<(), String> {
 			Escrow::do_try_state().map_err(|e| format!("{e:?}"))
@@ -178,6 +220,7 @@ pub mod v0 {
 			min_milestone: 1,
 			deposit: 0,
 			max_milestones: fixed::MAX_MILESTONES as usize,
+			existential_deposit: EXISTENTIAL_DEPOSIT,
 		};
 
 		fn new_ext() -> sp_io::TestExternalities {
@@ -233,5 +276,28 @@ pub mod v0 {
 		fn next_id() -> u32 {
 			pallet_escrow_v0::NextEscrowId::<Runtime>::get()
 		}
+		fn escrows() -> BTreeMap<u32, Record> {
+			pallet_escrow_v0::Escrows::<Runtime>::iter()
+				.map(|(id, e)| {
+					let record = Record {
+						payer: e.payer,
+						beneficiary: e.beneficiary,
+						arbiter: e.arbiter,
+						milestones: e.milestones,
+						released: e.released,
+						remaining: e.remaining,
+						deposit: 0,
+						deadline: e.deadline,
+					};
+					(id, record)
+				})
+				.collect()
+		}
+		// v0's events predate the spec: `Created` has no beneficiary, `Cancelled` no amount and
+		// there is no `Completed`. Holding it to them would bury the fund-loss findings.
+		fn events() -> Option<Vec<SpecEvent>> {
+			None
+		}
+		fn reset_events() {}
 	}
 }

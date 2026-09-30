@@ -1,16 +1,23 @@
 //! The written escrow spec as an executable oracle.
 //!
-//! The model does not re-implement the pallet. It only answers two questions for each call:
-//! is this call allowed by the spec, and if it succeeds, exactly which balances move and by how
-//! much. The driver then holds the pallet to three rules:
+//! The model does not re-implement the pallet. For each call it answers two questions: must this
+//! call fail, and for which reasons; and if it must not, exactly what does it do to balances,
+//! escrow storage and events. The driver then holds the pallet to four rules:
 //!
-//! 1. A call that returns `Ok` must be allowed by the spec and have exactly the spec's effect on
-//!    every account's free balance and both hold balances.
-//! 2. A call that returns `Err` must change nothing.
+//! 1. A call the spec gives no reason to reject must return `Ok` and have exactly the spec's
+//!    effect on every account's free balance and both hold balances, on the stored escrows and
+//!    on the events emitted.
+//! 2. A call the spec rejects must return `Err` with an error that is one of the spec's reasons,
+//!    and change nothing.
 //! 3. No call may panic, and total issuance never changes.
+//! 4. The pallet's own `try_state` holds after every call.
+//!
+//! Rule 1 is what makes the oracle two-sided: a pallet that refuses a call it owes the caller
+//! (funds that can never be paid out or refunded) fails it as surely as one that pays the wrong
+//! account.
 
 use arbitrary::Arbitrary;
-use sp_runtime::DispatchResult;
+use sp_runtime::{DispatchError, DispatchResult, ModuleError};
 use std::{
 	collections::BTreeMap,
 	fmt,
@@ -56,6 +63,34 @@ pub struct SpecParams {
 	pub min_milestone: u64,
 	pub deposit: u64,
 	pub max_milestones: usize,
+	pub existential_deposit: u64,
+}
+
+/// Returned by a target for a `create` whose milestones exceed the bound: such a call never
+/// decodes, so it cannot reach the pallet.
+pub const UNDECODABLE: &str = "call does not decode: too many milestones";
+
+/// An escrow as the spec sees it. Targets report their storage in this shape.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+	pub payer: u64,
+	pub beneficiary: u64,
+	pub arbiter: Option<u64>,
+	pub milestones: Vec<u64>,
+	pub released: u32,
+	pub remaining: u64,
+	pub deposit: u64,
+	pub deadline: u64,
+}
+
+/// The pallet's events, as the spec sees them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpecEvent {
+	Created { id: u32, payer: u64, beneficiary: u64, total: u64 },
+	MilestoneReleased { id: u32, index: u32, amount: u64 },
+	Completed { id: u32 },
+	Refunded { id: u32, amount: u64 },
+	Cancelled { id: u32, amount: u64 },
 }
 
 /// A pallet under test, wrapped in its own mock runtime.
@@ -81,9 +116,71 @@ pub trait Target {
 	fn held_deposit(who: u64) -> u64;
 	fn total_issuance() -> u64;
 	fn next_id() -> u32;
+	fn escrows() -> BTreeMap<u32, Record>;
+	/// Escrow events since the last [`Target::reset_events`], or `None` if this target's events
+	/// are not held to the spec.
+	fn events() -> Option<Vec<SpecEvent>>;
+	fn reset_events();
 	/// The pallet's own invariant check, if it has one.
 	fn try_state() -> Result<(), String> {
 		Ok(())
+	}
+}
+
+/// Why the spec rejects a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reason {
+	NotFound,
+	NotAuthorized,
+	SelfEscrow,
+	ArbiterConflict,
+	NoMilestones,
+	TooManyMilestones,
+	MilestoneTooSmall,
+	DeadlineInPast,
+	DeadlineNotReached,
+	Overflow,
+	/// The payer cannot put the escrow on hold without going below what the ledger requires
+	/// them to keep.
+	Funds,
+}
+
+impl Reason {
+	fn describe(self, call: &str) -> String {
+		match self {
+			Reason::NotFound => "no live escrow".into(),
+			Reason::NotAuthorized => format!("caller may not {call}"),
+			Reason::SelfEscrow => "payer is the beneficiary".into(),
+			Reason::ArbiterConflict => "arbiter is a party".into(),
+			Reason::NoMilestones => "no milestones".into(),
+			Reason::TooManyMilestones => "more milestones than the bound".into(),
+			Reason::MilestoneTooSmall => "milestone below minimum".into(),
+			Reason::DeadlineInPast => "deadline not in the future".into(),
+			Reason::DeadlineNotReached => "payer refunded before the deadline".into(),
+			Reason::Overflow => "milestone total overflows".into(),
+			Reason::Funds => "payer cannot afford it".into(),
+		}
+	}
+
+	/// The reason a dispatch error stands for. Both pallets name their errors the same way.
+	fn of(err: DispatchError) -> Option<Reason> {
+		match err {
+			DispatchError::Module(ModuleError { message: Some(name), .. }) => match name {
+				"NotFound" => Some(Reason::NotFound),
+				"NotAuthorized" => Some(Reason::NotAuthorized),
+				"SelfEscrow" => Some(Reason::SelfEscrow),
+				"ArbiterConflict" => Some(Reason::ArbiterConflict),
+				"NoMilestones" => Some(Reason::NoMilestones),
+				"MilestoneTooSmall" => Some(Reason::MilestoneTooSmall),
+				"DeadlineInPast" => Some(Reason::DeadlineInPast),
+				"DeadlineNotReached" => Some(Reason::DeadlineNotReached),
+				"Overflow" => Some(Reason::Overflow),
+				_ => None,
+			},
+			DispatchError::Token(_) => Some(Reason::Funds),
+			DispatchError::Other(UNDECODABLE) => Some(Reason::TooManyMilestones),
+			_ => None,
+		}
 	}
 }
 
@@ -162,10 +259,20 @@ fn caller(who: u8, parties: Option<&(u64, u64, Option<u64>)>) -> u64 {
 pub enum Kind {
 	/// The pallet panicked. Message included.
 	Panic(String),
-	/// The call succeeded although the spec forbids it.
-	SpecForbidden(&'static str),
+	/// The call succeeded although the spec rejects it, for this reason first.
+	SpecForbidden(Reason),
+	/// The call failed although the spec gives no reason to reject it.
+	Rejected,
+	/// The call failed, but not for any reason the spec gives.
+	WrongReason,
 	/// The call succeeded but moved different amounts than the spec says.
 	BalanceMismatch,
+	/// The call succeeded but emitted different events than the spec says.
+	EventMismatch,
+	/// The call succeeded but left an escrow the spec says is closed.
+	ClosedEscrowLeft,
+	/// The call succeeded but the stored escrows differ from the spec's.
+	StorageMismatch,
 	/// The call failed but still changed state.
 	StateChangedOnError,
 	/// Total issuance changed.
@@ -205,8 +312,13 @@ impl Violation {
 				format!("{call}: unwrap on missing escrow panic")
 			},
 			Kind::Panic(_) => format!("{call}: panic"),
-			Kind::SpecForbidden(why) => format!("{call}: succeeded but {why}"),
+			Kind::SpecForbidden(why) => format!("{call}: succeeded but {}", why.describe(call)),
+			Kind::Rejected => format!("{call}: rejected although the spec requires success"),
+			Kind::WrongReason => format!("{call}: rejected for a reason the spec does not give"),
 			Kind::BalanceMismatch => format!("{call}: balances moved differently from spec"),
+			Kind::EventMismatch => format!("{call}: events differ from spec"),
+			Kind::ClosedEscrowLeft => format!("{call}: closed escrow left in storage"),
+			Kind::StorageMismatch => format!("{call}: escrow storage differs from spec"),
 			Kind::StateChangedOnError => format!("{call}: failed but changed state"),
 			Kind::IssuanceChanged => format!("{call}: total issuance changed"),
 			Kind::IdMismatch => format!("{call}: escrow id not sequential"),
@@ -221,25 +333,27 @@ impl fmt::Display for Violation {
 	}
 }
 
-#[derive(Clone, Debug)]
-struct ModelEscrow {
-	payer: u64,
-	beneficiary: u64,
-	arbiter: Option<u64>,
-	milestones: Vec<u64>,
-	released: usize,
-	remaining: u64,
-	deposit: u64,
-	deadline: u64,
-}
-
 /// Per-account `(free, escrow hold, deposit hold)`.
 type Balances = BTreeMap<u64, (u64, u64, u64)>;
 
-fn snapshot<T: Target>() -> Balances {
-	(1..=ACCOUNTS)
-		.map(|who| (who, (T::free(who), T::held_escrow(who), T::held_deposit(who))))
-		.collect()
+/// Everything a call can change that the spec has an opinion on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct State {
+	balances: Balances,
+	escrows: BTreeMap<u32, Record>,
+	next_id: u32,
+	events: Option<Vec<SpecEvent>>,
+}
+
+fn snapshot<T: Target>() -> State {
+	State {
+		balances: (1..=ACCOUNTS)
+			.map(|who| (who, (T::free(who), T::held_escrow(who), T::held_deposit(who))))
+			.collect(),
+		escrows: T::escrows(),
+		next_id: T::next_id(),
+		events: T::events(),
+	}
 }
 
 /// Signed balance changes the spec expects from one successful call.
@@ -266,82 +380,128 @@ impl Effect {
 	}
 }
 
+/// What a successful call must do.
+#[derive(Default)]
+struct Expected {
+	effect: Effect,
+	events: Vec<SpecEvent>,
+}
+
 #[derive(Default)]
 struct Model {
-	escrows: BTreeMap<u32, ModelEscrow>,
+	escrows: BTreeMap<u32, Record>,
 	next_id: u32,
 	/// Parties of every escrow ever created, live or closed.
 	parties: BTreeMap<u32, (u64, u64, Option<u64>)>,
 }
 
+/// Whether `who` can move `amount` from free balance onto hold.
+///
+/// The ledger lets an account hold funds as long as its free balance stays at or above the
+/// existential deposit.
+fn can_hold(balances: &Balances, who: u64, amount: u64, p: SpecParams) -> bool {
+	let (free, ..) = balances[&who];
+	amount.checked_add(p.existential_deposit).is_some_and(|need| free >= need)
+}
+
 impl Model {
-	/// What the spec says a *successful* call must do, or why it must not succeed.
-	fn expect(&self, call: &Call, block: u64, p: SpecParams) -> Result<Effect, &'static str> {
-		let mut fx = Effect::default();
+	/// What a call must do, or every reason the spec gives for rejecting it.
+	fn expect(
+		&self,
+		call: &Call,
+		block: u64,
+		p: SpecParams,
+		before: &Balances,
+	) -> Result<Expected, Vec<Reason>> {
+		let mut out = Expected::default();
 		match call {
 			Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
+				let mut why = Vec::new();
 				if payer == beneficiary {
-					return Err("payer is the beneficiary");
+					why.push(Reason::SelfEscrow);
 				}
 				if arbiter.is_some_and(|a| a == *payer || a == *beneficiary) {
-					return Err("arbiter is a party");
+					why.push(Reason::ArbiterConflict);
 				}
 				if milestones.is_empty() {
-					return Err("no milestones");
+					why.push(Reason::NoMilestones);
 				}
 				if milestones.len() > p.max_milestones {
-					return Err("more milestones than the bound");
+					why.push(Reason::TooManyMilestones);
 				}
 				if milestones.iter().any(|m| *m < p.min_milestone) {
-					return Err("milestone below minimum");
+					why.push(Reason::MilestoneTooSmall);
 				}
 				if *deadline <= block {
-					return Err("deadline not in the future");
+					why.push(Reason::DeadlineInPast);
 				}
-				let total = milestones
-					.iter()
-					.try_fold(0u64, |acc, m| acc.checked_add(*m))
-					.ok_or("milestone total overflows")?;
-				let (total, deposit) = (i128::from(total), i128::from(p.deposit));
-				fx.add(*payer, -(total + deposit), total, deposit);
+				let total = milestones.iter().try_fold(0u64, |acc, m| acc.checked_add(*m));
+				match total {
+					None => why.push(Reason::Overflow),
+					Some(total) => {
+						let affordable = total
+							.checked_add(p.deposit)
+							.is_some_and(|need| can_hold(before, *payer, need, p));
+						if !affordable {
+							why.push(Reason::Funds);
+						}
+					},
+				}
+				if !why.is_empty() {
+					return Err(why);
+				}
+				let total = total.expect("checked above");
+				let (t, d) = (i128::from(total), i128::from(p.deposit));
+				out.effect.add(*payer, -(t + d), t, d);
+				out.events.push(SpecEvent::Created {
+					id: self.next_id,
+					payer: *payer,
+					beneficiary: *beneficiary,
+					total,
+				});
 			},
 			Call::Release { who, id } => {
-				let e = self.escrows.get(id).ok_or("no live escrow")?;
+				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
 				if *who != e.payer && Some(*who) != e.arbiter {
-					return Err("caller may not release");
+					return Err(vec![Reason::NotAuthorized]);
 				}
-				let amount = i128::from(e.milestones[e.released]);
-				fx.add(e.payer, 0, -amount, 0);
-				fx.add(e.beneficiary, amount, 0, 0);
-				if e.released + 1 == e.milestones.len() {
+				let index = e.released;
+				let amount = e.milestones[index as usize];
+				out.effect.add(e.payer, 0, -i128::from(amount), 0);
+				out.effect.add(e.beneficiary, i128::from(amount), 0, 0);
+				out.events.push(SpecEvent::MilestoneReleased { id: *id, index, amount });
+				if index as usize + 1 == e.milestones.len() {
 					let deposit = i128::from(e.deposit);
-					fx.add(e.payer, deposit, 0, -deposit);
+					out.effect.add(e.payer, deposit, 0, -deposit);
+					out.events.push(SpecEvent::Completed { id: *id });
 				}
 			},
 			Call::Refund { who, id } => {
-				let e = self.escrows.get(id).ok_or("no live escrow")?;
+				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
 				if Some(*who) != e.arbiter {
 					if *who != e.payer {
-						return Err("caller may not refund");
+						return Err(vec![Reason::NotAuthorized]);
 					}
 					if block < e.deadline {
-						return Err("payer refunded before the deadline");
+						return Err(vec![Reason::DeadlineNotReached]);
 					}
 				}
-				Self::close(&mut fx, e);
+				Self::close(&mut out.effect, e);
+				out.events.push(SpecEvent::Refunded { id: *id, amount: e.remaining });
 			},
 			Call::Cancel { who, id } => {
-				let e = self.escrows.get(id).ok_or("no live escrow")?;
+				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
 				if *who != e.beneficiary {
-					return Err("caller may not cancel");
+					return Err(vec![Reason::NotAuthorized]);
 				}
-				Self::close(&mut fx, e);
+				Self::close(&mut out.effect, e);
+				out.events.push(SpecEvent::Cancelled { id: *id, amount: e.remaining });
 			},
 		}
-		Ok(fx)
+		Ok(out)
 	}
 
-	fn close(fx: &mut Effect, e: &ModelEscrow) {
+	fn close(fx: &mut Effect, e: &Record) {
 		let (remaining, deposit) = (i128::from(e.remaining), i128::from(e.deposit));
 		fx.add(e.payer, remaining + deposit, -remaining, -deposit);
 	}
@@ -352,7 +512,7 @@ impl Model {
 			Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
 				self.escrows.insert(
 					self.next_id,
-					ModelEscrow {
+					Record {
 						payer: *payer,
 						beneficiary: *beneficiary,
 						arbiter: *arbiter,
@@ -368,9 +528,9 @@ impl Model {
 			},
 			Call::Release { id, .. } => {
 				let e = self.escrows.get_mut(id).expect("checked in expect");
-				e.remaining -= e.milestones[e.released];
+				e.remaining -= e.milestones[e.released as usize];
 				e.released += 1;
-				if e.released == e.milestones.len() {
+				if e.released as usize == e.milestones.len() {
 					self.escrows.remove(id);
 				}
 			},
@@ -403,6 +563,11 @@ enum Call {
 		who: u64,
 		id: u32,
 	},
+}
+
+thread_local! {
+	/// Set while a pallet call runs, so [`crate::quiet_panics`] silences only its panics.
+	pub(crate) static IN_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Longest sequence the driver will run; fuzz inputs are truncated to this.
@@ -486,7 +651,9 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 				},
 			};
 
+			T::reset_events();
 			let before = snapshot::<T>();
+			IN_CALL.with(|c| c.set(true));
 			let outcome = catch_unwind(AssertUnwindSafe(|| match &call {
 				Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
 					T::create(*payer, *beneficiary, *arbiter, milestones.clone(), *deadline)
@@ -495,6 +662,7 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 				Call::Refund { who, id } => T::refund(*who, *id),
 				Call::Cancel { who, id } => T::cancel(*who, *id),
 			}));
+			IN_CALL.with(|c| c.set(false));
 			let outcome = match outcome {
 				Ok(outcome) => outcome,
 				Err(payload) => {
@@ -514,8 +682,23 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 			};
 			CALLS[kind][usize::from(outcome.is_err())].fetch_add(1, Ordering::Relaxed);
 
-			match outcome {
-				Err(err) => {
+			let expected = model.expect(&call, block, T::PARAMS, &before.balances);
+			match (outcome, expected) {
+				(Err(err), Ok(_)) => {
+					return Err(fail(
+						Kind::Rejected,
+						format!("{call:?} returned {err:?}, the spec gives no reason to reject it"),
+					));
+				},
+				(Err(err), Err(reasons)) => {
+					if !Reason::of(err).is_some_and(|r| reasons.contains(&r)) {
+						return Err(fail(
+							Kind::WrongReason,
+							format!(
+								"{call:?} returned {err:?}, the spec's reasons are {reasons:?}"
+							),
+						));
+					}
 					if after != before {
 						return Err(fail(
 							Kind::StateChangedOnError,
@@ -523,22 +706,52 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 						));
 					}
 				},
-				Ok(()) => {
-					let effect = model.expect(&call, block, T::PARAMS).map_err(|why| {
-						fail(Kind::SpecForbidden(why), format!("{call:?} returned Ok"))
-					})?;
-					let expected = effect.apply(&before);
-					if expected.as_ref() != Some(&after) {
+				(Ok(()), Err(reasons)) => {
+					return Err(fail(
+						Kind::SpecForbidden(reasons[0]),
+						format!("{call:?} returned Ok, the spec's reasons are {reasons:?}"),
+					));
+				},
+				(Ok(()), Ok(expected)) => {
+					let balances = expected.effect.apply(&before.balances);
+					if balances.as_ref() != Some(&after.balances) {
 						return Err(fail(
 							Kind::BalanceMismatch,
-							format!("{call:?}\n  expected {expected:?}\n  actual   {after:?}"),
+							format!(
+								"{call:?}\n  expected {balances:?}\n  actual   {:?}",
+								after.balances
+							),
+						));
+					}
+					if after.events.as_ref().is_some_and(|events| *events != expected.events) {
+						return Err(fail(
+							Kind::EventMismatch,
+							format!(
+								"{call:?}\n  expected {:?}\n  actual   {:?}",
+								expected.events, after.events
+							),
 						));
 					}
 					model.commit(&call, T::PARAMS);
-					if T::next_id() != model.next_id {
+					if after.next_id != model.next_id {
 						return Err(fail(
 							Kind::IdMismatch,
-							format!("pallet next id {} model {}", T::next_id(), model.next_id),
+							format!("pallet next id {} model {}", after.next_id, model.next_id),
+						));
+					}
+					if after.escrows != model.escrows {
+						let left = after.escrows.keys().find(|id| !model.escrows.contains_key(id));
+						let kind = if left.is_some() {
+							Kind::ClosedEscrowLeft
+						} else {
+							Kind::StorageMismatch
+						};
+						return Err(fail(
+							kind,
+							format!(
+								"{call:?}\n  expected {:?}\n  actual   {:?}",
+								model.escrows, after.escrows
+							),
 						));
 					}
 				},

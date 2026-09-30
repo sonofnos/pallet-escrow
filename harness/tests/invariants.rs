@@ -50,6 +50,7 @@ fn harness_rediscovers_the_v0_audit_findings() {
 		(
 			"ESC-02 cancelled escrow stays live",
 			&[
+				"cancel: closed escrow left in storage",
 				"cancel: succeeded but no live escrow",
 				"release: succeeded but no live escrow",
 				"refund: succeeded but no live escrow",
@@ -62,7 +63,10 @@ fn harness_rediscovers_the_v0_audit_findings() {
 			&["refund: succeeded but payer refunded before the deadline"],
 		),
 		("ESC-06a panic on unknown id", &["release: unwrap on missing escrow panic"]),
-		("ESC-06b panic after the last milestone", &["release: index out of bounds panic"]),
+		(
+			"ESC-06b panic after the last milestone",
+			&["release: closed escrow left in storage", "release: index out of bounds panic"],
+		),
 	];
 	let missing: Vec<&str> = expected
 		.iter()
