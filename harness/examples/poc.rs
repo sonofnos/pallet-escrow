@@ -7,7 +7,7 @@
 //! see ESC-03's real on-chain effect; with overflow checks the first call panics instead.
 
 use escrow_harness::{
-	runtimes::{fixed, v0},
+	runtimes::{v0, v2},
 	spec::Target,
 };
 use frame_support::traits::fungible::{Inspect, InspectHold};
@@ -81,29 +81,37 @@ fn esc03_wrapped_total_drains_the_shared_hold() {
 	});
 }
 
-type Milestones =
-	frame_support::BoundedVec<u64, frame_support::traits::ConstU32<{ fixed::MAX_MILESTONES }>>;
+type Milestones = frame_support::BoundedVec<
+	pallet_escrow::Milestone<u128, u64>,
+	frame_support::traits::ConstU32<{ v2::MAX_MILESTONES }>,
+>;
 
-fn ms(v: Vec<u64>) -> Milestones {
-	v.try_into().unwrap()
+/// Milestones due at block 100.
+fn ms(amounts: Vec<u128>) -> Milestones {
+	let milestones: Vec<_> = amounts
+		.into_iter()
+		.map(|amount| pallet_escrow::Milestone { amount, deadline: 100 })
+		.collect();
+	milestones.try_into().unwrap()
 }
 
 fn hardened_pallet_blocks_all_three() {
 	println!("\nSame steps against the hardened pallet:");
-	fixed::Fixed::new_ext().execute_with(|| {
-		let o = fixed::RuntimeOrigin::signed;
-		fixed::Escrow::create(o(PAYER), HONEST, Some(ARBITER), ms(vec![1_000]), 100).unwrap();
-		fixed::Escrow::create(o(PAYER), PUPPET, None, ms(vec![1_000]), 100).unwrap();
-		fixed::Escrow::refund(o(ARBITER), 0).unwrap();
+	v2::V2::new_ext().execute_with(|| {
+		let o = |who: u64| v2::RuntimeOrigin::signed(who.into());
+		let (honest, puppet) = (HONEST.into(), PUPPET.into());
+		v2::Escrow::create(o(PAYER), honest, Some(ARBITER.into()), ms(vec![1_000])).unwrap();
+		v2::Escrow::create(o(PAYER), puppet, None, ms(vec![1_000])).unwrap();
+		v2::Escrow::refund(o(ARBITER), 0).unwrap();
 		println!(
 			"  ESC-01 arbiter refund: arbiter balance {} (unchanged), payer got the funds back",
-			fixed::Balances::balance(&ARBITER)
+			v2::Balances::balance(&ARBITER.into())
 		);
-		fixed::Escrow::cancel(o(PUPPET), 1).unwrap();
-		println!("  ESC-02 second cancel: {:?}", fixed::Escrow::cancel(o(PUPPET), 1));
+		v2::Escrow::cancel(o(PUPPET), 1).unwrap();
+		println!("  ESC-02 second cancel: {:?}", v2::Escrow::cancel(o(PUPPET), 1));
 		println!(
 			"  ESC-03 wrapping milestones: {:?}",
-			fixed::Escrow::create(o(PAYER), PUPPET, None, ms(vec![u64::MAX - 5, 10]), 100)
+			v2::Escrow::create(o(PAYER), puppet, None, ms(vec![u128::MAX - 5, 10]))
 		);
 	});
 }

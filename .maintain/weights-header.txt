@@ -1,0 +1,3 @@
+// Generated with the command below against `runtime/`, the minimal benchmark runtime. The machine
+// named below is not reference hardware: regenerate on reference hardware before production use.
+// CI regenerates this file on every push (job `weights`) and uploads it as an artifact.

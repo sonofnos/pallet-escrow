@@ -18,6 +18,7 @@ pallet-balances = { workspace = true, features = ["std"] }
 sp-io = { workspace = true, features = ["std"] }
 sp-runtime = { workspace = true, features = ["std"] }
 pallet-escrow = { workspace = true, features = ["std", "try-runtime"] }
+pallet-escrow-v1 = { workspace = true, features = ["std", "try-runtime"] }
 pallet-escrow-v0 = { workspace = true, features = ["std"] }
 
 [features]

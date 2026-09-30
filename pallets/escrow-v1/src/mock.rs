@@ -1,10 +1,9 @@
-use crate as pallet_escrow;
+use crate as pallet_escrow_v1;
 use frame_support::{
 	derive_impl,
 	traits::{ConstU32, ConstU64},
-	PalletId,
 };
-use sp_runtime::{traits::IdentityLookup, BuildStorage};
+use sp_runtime::BuildStorage;
 
 type Block = frame_system::mocking::MockBlock<Test>;
 
@@ -12,19 +11,13 @@ frame_support::construct_runtime!(
 	pub enum Test {
 		System: frame_system,
 		Balances: pallet_balances,
-		Escrow: pallet_escrow,
+		Escrow: pallet_escrow_v1,
 	}
 );
-
-// Escrow accounts are derived from the pallet id and the escrow id; a `u64` account would
-// truncate that to the same account for every escrow.
-pub type AccountId = u128;
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
 	type Block = Block;
-	type AccountId = AccountId;
-	type Lookup = IdentityLookup<AccountId>;
 	type AccountData = pallet_balances::AccountData<u64>;
 }
 
@@ -36,45 +29,35 @@ impl pallet_balances::Config for Test {
 pub const MIN_MILESTONE: u64 = 10;
 pub const DEPOSIT: u64 = 5;
 pub const MAX_MILESTONES: u32 = 8;
-pub const CHALLENGE_PERIOD: u64 = 5;
 
-frame_support::parameter_types! {
-	pub const EscrowPalletId: PalletId = PalletId(*b"py/escrw");
-}
-
-impl pallet_escrow::Config for Test {
+impl pallet_escrow_v1::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type PalletId = EscrowPalletId;
 	type MaxMilestones = ConstU32<MAX_MILESTONES>;
 	type MinMilestone = ConstU64<MIN_MILESTONE>;
 	type EscrowDeposit = ConstU64<DEPOSIT>;
-	type ChallengePeriod = ConstU64<CHALLENGE_PERIOD>;
 	type WeightInfo = ();
 }
 
-pub const PAYER: AccountId = 1;
-pub const BENEFICIARY: AccountId = 2;
-pub const ARBITER: AccountId = 3;
-pub const STRANGER: AccountId = 4;
+pub const PAYER: u64 = 1;
+pub const BENEFICIARY: u64 = 2;
+pub const ARBITER: u64 = 3;
+pub const STRANGER: u64 = 4;
 pub const START_BALANCE: u64 = 1_000;
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
-	// The whole runtime's genesis, so every pallet's storage version is recorded as on a chain.
-	let storage = RuntimeGenesisConfig {
-		balances: pallet_balances::GenesisConfig {
-			balances: vec![
-				(PAYER, START_BALANCE),
-				(BENEFICIARY, START_BALANCE),
-				(ARBITER, START_BALANCE),
-				(STRANGER, START_BALANCE),
-			],
-			..Default::default()
-		},
+	let mut storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
+	pallet_balances::GenesisConfig::<Test> {
+		balances: vec![
+			(PAYER, START_BALANCE),
+			(BENEFICIARY, START_BALANCE),
+			(ARBITER, START_BALANCE),
+			(STRANGER, START_BALANCE),
+		],
 		..Default::default()
 	}
-	.build_storage()
+	.assimilate_storage(&mut storage)
 	.unwrap();
 	let mut ext: sp_io::TestExternalities = storage.into();
 	ext.execute_with(|| System::set_block_number(1));

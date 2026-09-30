@@ -82,7 +82,13 @@ pub fn hunt<T: Target>(seeds: u64) -> Vec<Finding> {
 	found.into_values().collect()
 }
 
-/// Silence the default panic printout; the harness reports panics itself.
+/// Silence the default panic printout for pallet calls, whose panics the harness reports
+/// itself. A panic anywhere else is a harness bug and still prints.
 pub fn quiet_panics() {
-	std::panic::set_hook(Box::new(|_| {}));
+	let default = std::panic::take_hook();
+	std::panic::set_hook(Box::new(move |info| {
+		if !spec::IN_CALL.with(|c| c.get()) {
+			default(info)
+		}
+	}));
 }

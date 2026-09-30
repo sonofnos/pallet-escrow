@@ -1,25 +1,36 @@
 use escrow_harness::{
 	hunt, quiet_panics,
-	runtimes::{fixed::Fixed, v0::V0},
+	runtimes::{v0::V0, v1::V1, v2::V2},
+	spec::Target,
 };
 
 fn seeds(default: u64) -> u64 {
 	std::env::var("HARNESS_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
-#[test]
-fn hardened_pallet_never_violates_the_spec() {
+fn never_violates_the_spec<T: Target>() {
 	quiet_panics();
 	escrow_harness::spec::reset_coverage();
-	let findings = hunt::<Fixed>(seeds(4_000));
-	eprintln!("pallet-escrow calls:\n{}", escrow_harness::spec::coverage());
+	let findings = hunt::<T>(seeds(4_000));
+	eprintln!("{} calls:\n{}", T::NAME, escrow_harness::spec::coverage());
 	for f in &findings {
 		eprintln!(
 			"{} (seed {}, {} hits)\n  {}\n  repro: {:?}",
 			f.label, f.seed, f.hits, f.violation, f.reproduction
 		);
 	}
-	assert!(findings.is_empty(), "{} violation classes in pallet-escrow", findings.len());
+	assert!(findings.is_empty(), "{} violation classes in {}", findings.len(), T::NAME);
+}
+
+#[test]
+fn pallet_never_violates_the_spec() {
+	never_violates_the_spec::<V2>();
+}
+
+/// The hold-based pallet, on the part of the spec it implements: no claims, one deadline.
+#[test]
+fn hold_based_pallet_never_violates_the_spec() {
+	never_violates_the_spec::<V1>();
 }
 
 /// The audit's findings, each rediscovered by the harness without being told where to look.
@@ -50,6 +61,7 @@ fn harness_rediscovers_the_v0_audit_findings() {
 		(
 			"ESC-02 cancelled escrow stays live",
 			&[
+				"cancel: closed escrow left in storage",
 				"cancel: succeeded but no live escrow",
 				"release: succeeded but no live escrow",
 				"refund: succeeded but no live escrow",
@@ -62,7 +74,10 @@ fn harness_rediscovers_the_v0_audit_findings() {
 			&["refund: succeeded but payer refunded before the deadline"],
 		),
 		("ESC-06a panic on unknown id", &["release: unwrap on missing escrow panic"]),
-		("ESC-06b panic after the last milestone", &["release: index out of bounds panic"]),
+		(
+			"ESC-06b panic after the last milestone",
+			&["release: closed escrow left in storage", "release: index out of bounds panic"],
+		),
 	];
 	let missing: Vec<&str> = expected
 		.iter()
