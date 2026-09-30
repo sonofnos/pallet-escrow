@@ -1,37 +1,50 @@
-use crate::{mock::*, Error, EscrowCount, Escrows, Event, HoldReason, NextEscrowId};
+use crate::{mock::*, Claim, Error, Escrows, Event, Milestone, NextEscrowId};
 use frame_support::{
 	assert_noop, assert_ok,
-	traits::{fungible::InspectHold, ConstU32},
+	traits::{fungible::Mutate, tokens::Preservation, ConstU32},
 	BoundedVec,
 };
 
-type Milestones = BoundedVec<u64, ConstU32<MAX_MILESTONES>>;
+type Milestones = BoundedVec<Milestone<u64, u64>, ConstU32<MAX_MILESTONES>>;
 
-fn ms(amounts: &[u64]) -> Milestones {
-	amounts.to_vec().try_into().expect("test milestones fit the bound")
+/// Milestones as `(amount, deadline)`.
+fn ms(milestones: &[(u64, u64)]) -> Milestones {
+	milestones
+		.iter()
+		.map(|&(amount, deadline)| Milestone { amount, deadline })
+		.collect::<Vec<_>>()
+		.try_into()
+		.expect("test milestones fit the bound")
 }
 
-fn held(who: u64) -> u64 {
-	Balances::balance_on_hold(&HoldReason::Escrow.into(), &who)
+/// Milestones sharing one deadline.
+fn due(amounts: &[u64], deadline: u64) -> Milestones {
+	ms(&amounts.iter().map(|a| (*a, deadline)).collect::<Vec<_>>())
 }
 
-fn deposit_held(who: u64) -> u64 {
-	Balances::balance_on_hold(&HoldReason::StorageDeposit.into(), &who)
+fn free(who: AccountId) -> u64 {
+	Balances::free_balance(who)
 }
 
-fn open(milestones: &[u64], arbiter: Option<u64>, deadline: u64) -> u32 {
+fn in_escrow(id: u32) -> u64 {
+	Balances::free_balance(Escrow::account(id))
+}
+
+fn open_with(milestones: Milestones, arbiter: Option<AccountId>) -> u32 {
 	let id = NextEscrowId::<Test>::get();
-	assert_ok!(Escrow::create(
-		RuntimeOrigin::signed(PAYER),
-		BENEFICIARY,
-		arbiter,
-		ms(milestones),
-		deadline
-	));
+	assert_ok!(Escrow::create(RuntimeOrigin::signed(PAYER), BENEFICIARY, arbiter, milestones));
 	id
 }
 
-/// Run a test body and check the pallet's accounting invariant afterwards.
+fn open(amounts: &[u64], arbiter: Option<AccountId>, deadline: u64) -> u32 {
+	open_with(due(amounts, deadline), arbiter)
+}
+
+fn signed(who: AccountId) -> RuntimeOrigin {
+	RuntimeOrigin::signed(who)
+}
+
+/// Run a test body and check the pallet's custody invariant afterwards.
 fn run(test: impl FnOnce()) {
 	new_test_ext().execute_with(|| {
 		test();
@@ -40,15 +53,14 @@ fn run(test: impl FnOnce()) {
 }
 
 #[test]
-fn create_holds_total_and_deposit() {
+fn create_moves_total_and_deposit_into_the_escrow_account() {
 	run(|| {
 		let id = open(&[100, 50], Some(ARBITER), 10);
-		assert_eq!(held(PAYER), 150);
-		assert_eq!(deposit_held(PAYER), DEPOSIT);
-		assert_eq!(Balances::free_balance(PAYER), START_BALANCE - 150 - DEPOSIT);
+		assert_eq!(in_escrow(id), 150 + DEPOSIT);
+		assert_eq!(free(PAYER), START_BALANCE - 150 - DEPOSIT);
 		let escrow = Escrows::<Test>::get(id).unwrap();
 		assert_eq!(escrow.remaining, 150);
-		assert_eq!(escrow.released, 0);
+		assert_eq!(escrow.deposit, DEPOSIT);
 		System::assert_last_event(
 			Event::Created { id, payer: PAYER, beneficiary: BENEFICIARY, total: 150 }.into(),
 		);
@@ -59,16 +71,15 @@ fn create_holds_total_and_deposit() {
 fn releases_pay_in_order_and_completion_cleans_up() {
 	run(|| {
 		let id = open(&[100, 50], None, 10);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 100);
-		assert_eq!(held(PAYER), 50);
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 100);
+		assert_eq!(in_escrow(id), 50 + DEPOSIT);
 
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 150);
-		assert_eq!(held(PAYER), 0);
-		assert_eq!(deposit_held(PAYER), 0);
-		assert_eq!(Balances::free_balance(PAYER), START_BALANCE - 150);
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 150);
+		assert_eq!(free(PAYER), START_BALANCE - 150);
 		assert!(Escrows::<Test>::get(id).is_none());
+		assert!(!System::account_exists(&Escrow::account(id)));
 		System::assert_last_event(Event::Completed { id }.into());
 	});
 }
@@ -77,8 +88,8 @@ fn releases_pay_in_order_and_completion_cleans_up() {
 fn arbiter_can_release() {
 	run(|| {
 		let id = open(&[100], Some(ARBITER), 10);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(ARBITER), id));
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 100);
+		assert_ok!(Escrow::release(signed(ARBITER), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 100);
 	});
 }
 
@@ -87,14 +98,9 @@ fn arbiter_can_release() {
 fn stranger_and_beneficiary_cannot_release() {
 	run(|| {
 		let id = open(&[100], Some(ARBITER), 10);
-		assert_noop!(
-			Escrow::release(RuntimeOrigin::signed(STRANGER), id),
-			Error::<Test>::NotAuthorized
-		);
-		assert_noop!(
-			Escrow::release(RuntimeOrigin::signed(BENEFICIARY), id),
-			Error::<Test>::NotAuthorized
-		);
+		for who in [STRANGER, BENEFICIARY] {
+			assert_noop!(Escrow::release(signed(who), id), Error::<Test>::NotAuthorized);
+		}
 	});
 }
 
@@ -103,38 +109,26 @@ fn stranger_and_beneficiary_cannot_release() {
 fn arbiter_refund_pays_the_payer_not_the_arbiter() {
 	run(|| {
 		let id = open(&[100, 50], Some(ARBITER), 10);
-		assert_ok!(Escrow::refund(RuntimeOrigin::signed(ARBITER), id));
-		assert_eq!(Balances::free_balance(ARBITER), START_BALANCE);
-		assert_eq!(Balances::free_balance(PAYER), START_BALANCE);
-		assert_eq!(held(PAYER), 0);
+		assert_ok!(Escrow::refund(signed(ARBITER), id));
+		assert_eq!(free(ARBITER), START_BALANCE);
+		assert_eq!(free(PAYER), START_BALANCE);
 		System::assert_last_event(Event::Refunded { id, amount: 150 }.into());
 	});
 }
 
 // ESC-05: v0 let the payer take the money back before the deadline.
 #[test]
-fn payer_refund_waits_for_deadline() {
+fn payer_refund_waits_for_the_next_deadline() {
 	run(|| {
-		let id = open(&[100], None, 10);
-		assert_noop!(
-			Escrow::refund(RuntimeOrigin::signed(PAYER), id),
-			Error::<Test>::DeadlineNotReached
-		);
-		System::set_block_number(10);
-		assert_ok!(Escrow::refund(RuntimeOrigin::signed(PAYER), id));
-		assert_eq!(Balances::free_balance(PAYER), START_BALANCE);
-	});
-}
-
-#[test]
-fn refund_after_partial_release_returns_only_the_rest() {
-	run(|| {
-		let id = open(&[100, 50], None, 10);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
-		System::set_block_number(10);
-		assert_ok!(Escrow::refund(RuntimeOrigin::signed(PAYER), id));
-		assert_eq!(Balances::free_balance(PAYER), START_BALANCE - 100);
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 100);
+		let id = open_with(ms(&[(100, 10), (50, 20)]), None);
+		assert_noop!(Escrow::refund(signed(PAYER), id), Error::<Test>::DeadlineNotReached);
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		System::set_block_number(15);
+		assert_noop!(Escrow::refund(signed(PAYER), id), Error::<Test>::DeadlineNotReached);
+		System::set_block_number(20);
+		assert_ok!(Escrow::refund(signed(PAYER), id));
+		assert_eq!(free(PAYER), START_BALANCE - 100);
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 100);
 	});
 }
 
@@ -144,10 +138,7 @@ fn only_parties_can_refund() {
 		let id = open(&[100], Some(ARBITER), 10);
 		System::set_block_number(20);
 		for who in [BENEFICIARY, STRANGER] {
-			assert_noop!(
-				Escrow::refund(RuntimeOrigin::signed(who), id),
-				Error::<Test>::NotAuthorized
-			);
+			assert_noop!(Escrow::refund(signed(who), id), Error::<Test>::NotAuthorized);
 		}
 	});
 }
@@ -159,14 +150,11 @@ fn cancel_is_final_and_leaves_other_escrows_funded() {
 	run(|| {
 		let first = open(&[100], None, 10);
 		let second = open(&[200], None, 10);
-		assert_ok!(Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), first));
-		assert_noop!(
-			Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), first),
-			Error::<Test>::NotFound
-		);
-		assert_eq!(held(PAYER), 200);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), second));
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 200);
+		assert_ok!(Escrow::cancel(signed(BENEFICIARY), first));
+		assert_noop!(Escrow::cancel(signed(BENEFICIARY), first), Error::<Test>::NotFound);
+		assert_eq!(in_escrow(second), 200 + DEPOSIT);
+		assert_ok!(Escrow::release(signed(PAYER), second));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 200);
 	});
 }
 
@@ -175,10 +163,7 @@ fn only_the_beneficiary_can_cancel() {
 	run(|| {
 		let id = open(&[100], Some(ARBITER), 10);
 		for who in [PAYER, ARBITER, STRANGER] {
-			assert_noop!(
-				Escrow::cancel(RuntimeOrigin::signed(who), id),
-				Error::<Test>::NotAuthorized
-			);
+			assert_noop!(Escrow::cancel(signed(who), id), Error::<Test>::NotAuthorized);
 		}
 	});
 }
@@ -187,16 +172,11 @@ fn only_the_beneficiary_can_cancel() {
 #[test]
 fn milestone_overflow_is_rejected() {
 	run(|| {
-		assert_noop!(
-			Escrow::create(
-				RuntimeOrigin::signed(PAYER),
-				BENEFICIARY,
-				None,
-				ms(&[u64::MAX, MIN_MILESTONE]),
-				10
-			),
-			Error::<Test>::Overflow
-		);
+		let create =
+			|amounts: &[u64]| Escrow::create(signed(PAYER), BENEFICIARY, None, due(amounts, 10));
+		assert_noop!(create(&[u64::MAX, MIN_MILESTONE]), Error::<Test>::Overflow);
+		// The total fits, the total plus the deposit does not.
+		assert_noop!(create(&[u64::MAX - 1]), Error::<Test>::Overflow);
 	});
 }
 
@@ -204,15 +184,13 @@ fn milestone_overflow_is_rejected() {
 #[test]
 fn unknown_or_finished_escrow_is_an_error_not_a_panic() {
 	run(|| {
-		assert_noop!(Escrow::release(RuntimeOrigin::signed(PAYER), 42), Error::<Test>::NotFound);
-		assert_noop!(Escrow::refund(RuntimeOrigin::signed(PAYER), 42), Error::<Test>::NotFound);
-		assert_noop!(
-			Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), 42),
-			Error::<Test>::NotFound
-		);
+		assert_noop!(Escrow::release(signed(PAYER), 42), Error::<Test>::NotFound);
+		assert_noop!(Escrow::refund(signed(PAYER), 42), Error::<Test>::NotFound);
+		assert_noop!(Escrow::cancel(signed(BENEFICIARY), 42), Error::<Test>::NotFound);
+		assert_noop!(Escrow::submit(signed(BENEFICIARY), 42), Error::<Test>::NotFound);
 		let id = open(&[100], None, 10);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
-		assert_noop!(Escrow::release(RuntimeOrigin::signed(PAYER), id), Error::<Test>::NotFound);
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		assert_noop!(Escrow::release(signed(PAYER), id), Error::<Test>::NotFound);
 	});
 }
 
@@ -220,67 +198,60 @@ fn unknown_or_finished_escrow_is_an_error_not_a_panic() {
 #[test]
 fn create_rejects_bad_input() {
 	run(|| {
-		let create = |beneficiary, arbiter, milestones: &[u64], deadline| {
-			Escrow::create(
-				RuntimeOrigin::signed(PAYER),
-				beneficiary,
-				arbiter,
-				ms(milestones),
-				deadline,
-			)
+		let create = |beneficiary, arbiter, milestones| {
+			Escrow::create(signed(PAYER), beneficiary, arbiter, milestones)
 		};
-		assert_noop!(create(PAYER, None, &[100], 10), Error::<Test>::SelfEscrow);
-		assert_noop!(create(BENEFICIARY, Some(PAYER), &[100], 10), Error::<Test>::ArbiterConflict);
+		assert_noop!(create(PAYER, None, due(&[100], 10)), Error::<Test>::SelfEscrow);
 		assert_noop!(
-			create(BENEFICIARY, Some(BENEFICIARY), &[100], 10),
+			create(BENEFICIARY, Some(PAYER), due(&[100], 10)),
 			Error::<Test>::ArbiterConflict
 		);
-		assert_noop!(create(BENEFICIARY, None, &[], 10), Error::<Test>::NoMilestones);
 		assert_noop!(
-			create(BENEFICIARY, None, &[100, MIN_MILESTONE - 1], 10),
+			create(BENEFICIARY, Some(BENEFICIARY), due(&[100], 10)),
+			Error::<Test>::ArbiterConflict
+		);
+		assert_noop!(create(BENEFICIARY, None, due(&[], 10)), Error::<Test>::NoMilestones);
+		assert_noop!(
+			create(BENEFICIARY, None, due(&[100, MIN_MILESTONE - 1], 10)),
 			Error::<Test>::MilestoneTooSmall
 		);
-		assert_noop!(create(BENEFICIARY, None, &[100], 1), Error::<Test>::DeadlineInPast);
+		assert_noop!(create(BENEFICIARY, None, due(&[100], 1)), Error::<Test>::DeadlineInPast);
+		assert_noop!(
+			create(BENEFICIARY, None, ms(&[(100, 20), (100, 10)])),
+			Error::<Test>::DeadlinesOutOfOrder
+		);
 	});
 }
 
 #[test]
 fn create_without_funds_changes_nothing() {
 	run(|| {
-		// Enough for the milestones but not the deposit on top: the first hold succeeds, the
-		// second fails, and the transactional dispatch must roll back both.
-		assert!(Escrow::create(
-			RuntimeOrigin::signed(PAYER),
-			BENEFICIARY,
-			None,
-			ms(&[START_BALANCE - 1]),
-			10
-		)
-		.is_err());
-		assert_eq!(held(PAYER), 0);
-		assert_eq!(deposit_held(PAYER), 0);
+		// Enough for the milestones but not the deposit on top.
+		assert!(Escrow::create(signed(PAYER), BENEFICIARY, None, due(&[START_BALANCE - 1], 10))
+			.is_err());
+		assert_eq!(free(PAYER), START_BALANCE);
 		assert_eq!(NextEscrowId::<Test>::get(), 0);
 	});
 }
 
 #[test]
-fn escrows_from_one_payer_are_accounted_separately() {
+fn escrows_are_held_in_separate_accounts() {
 	run(|| {
 		let a = open(&[100, 100], Some(ARBITER), 10);
 		let b = open(&[300], None, 10);
 		let c = open(&[50, 50, 50], None, 10);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), a));
-		assert_ok!(Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), b));
-		assert_ok!(Escrow::refund(RuntimeOrigin::signed(ARBITER), a));
-		assert_eq!(held(PAYER), 150);
-		assert_eq!(deposit_held(PAYER), DEPOSIT);
-		assert!(Escrows::<Test>::get(c).is_some());
+		assert_ne!(Escrow::account(a), Escrow::account(b));
+		assert_ok!(Escrow::release(signed(PAYER), a));
+		assert_ok!(Escrow::cancel(signed(BENEFICIARY), b));
+		assert_ok!(Escrow::refund(signed(ARBITER), a));
+		assert_eq!(in_escrow(a), 0);
+		assert_eq!(in_escrow(b), 0);
+		assert_eq!(in_escrow(c), 150 + DEPOSIT);
 	});
 }
 
-// ESC-11: a lock applies to the whole balance, held funds included. Transferring out of the hold
-// politely let a payer who locked their balance (a conviction vote, say) block every payout,
-// the arbiter's included, then refund after the deadline.
+// ESC-11: in the hold-based pallet a lock on the payer covered the escrowed funds, so a payer who
+// locked their balance could block every payout. Here the funds have left the payer's account.
 #[test]
 #[allow(deprecated)]
 fn payer_lock_cannot_block_a_payout() {
@@ -288,36 +259,171 @@ fn payer_lock_cannot_block_a_payout() {
 	run(|| {
 		let id = open(&[100, 50], Some(ARBITER), 10);
 		Balances::set_lock(*b"democrac", &PAYER, START_BALANCE, WithdrawReasons::all());
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(ARBITER), id));
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
-		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 150);
+		assert_ok!(Escrow::release(signed(ARBITER), id));
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 150);
 	});
 }
 
 #[test]
-fn escrow_count_follows_live_escrows() {
+#[allow(deprecated)]
+fn locked_funds_cannot_be_escrowed() {
+	use frame_support::traits::{LockableCurrency, WithdrawReasons};
 	run(|| {
-		let a = open(&[100], None, 10);
-		let b = open(&[100, 50], None, 10);
-		assert_eq!(EscrowCount::<Test>::get(PAYER), 2);
-		assert_ok!(Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), a));
-		assert_eq!(EscrowCount::<Test>::get(PAYER), 1);
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), b));
-		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), b));
-		assert!(!EscrowCount::<Test>::contains_key(PAYER));
+		Balances::set_lock(*b"democrac", &PAYER, START_BALANCE - 100, WithdrawReasons::all());
+		assert!(Escrow::create(signed(PAYER), BENEFICIARY, None, due(&[200], 10)).is_err());
+		open(&[90], None, 10);
 	});
 }
 
-// `try_state` only sees payers with live escrows, so a hold that outlives the last one has to
-// be caught when that escrow closes.
 #[test]
-#[should_panic(expected = "hold left after the payer's last escrow closed")]
-fn hold_outliving_the_last_escrow_is_caught() {
-	use frame_support::traits::fungible::MutateHold;
-	new_test_ext().execute_with(|| {
+fn funds_sent_to_an_escrow_account_go_to_the_payer_on_close() {
+	run(|| {
 		let id = open(&[100], None, 10);
-		assert_ok!(Balances::hold(&HoldReason::Escrow.into(), &PAYER, 7));
-		let _ = Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), id);
+		assert_ok!(<Balances as Mutate<_>>::transfer(
+			&STRANGER,
+			&Escrow::account(id),
+			7,
+			Preservation::Expendable
+		));
+		assert_ok!(Escrow::cancel(signed(BENEFICIARY), id));
+		assert_eq!(free(PAYER), START_BALANCE + 7);
+		assert!(!System::account_exists(&Escrow::account(id)));
+	});
+}
+
+#[test]
+fn submit_needs_an_arbiter_and_the_beneficiary() {
+	run(|| {
+		let alone = open(&[100], None, 10);
+		assert_noop!(Escrow::submit(signed(BENEFICIARY), alone), Error::<Test>::NoArbiter);
+		let id = open(&[100], Some(ARBITER), 10);
+		for who in [PAYER, ARBITER, STRANGER] {
+			assert_noop!(Escrow::submit(signed(who), id), Error::<Test>::NotAuthorized);
+		}
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_noop!(Escrow::submit(signed(BENEFICIARY), id), Error::<Test>::ClaimPending);
+		System::assert_last_event(Event::Submitted { id, index: 0 }.into());
+	});
+}
+
+#[test]
+fn submit_closes_at_the_deadline() {
+	run(|| {
+		let id = open(&[100], Some(ARBITER), 10);
+		System::set_block_number(10);
+		assert_noop!(Escrow::submit(signed(BENEFICIARY), id), Error::<Test>::DeadlinePassed);
+	});
+}
+
+#[test]
+fn undisputed_claim_pays_after_the_challenge_period() {
+	run(|| {
+		let id = open(&[100, 50], Some(ARBITER), 10);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_noop!(Escrow::claim(signed(BENEFICIARY), id), Error::<Test>::ChallengeNotOver);
+		System::set_block_number(1 + CHALLENGE_PERIOD);
+		assert_noop!(Escrow::claim(signed(PAYER), id), Error::<Test>::NotAuthorized);
+		assert_ok!(Escrow::claim(signed(BENEFICIARY), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 100);
+		assert_eq!(Escrows::<Test>::get(id).unwrap().claim, None);
+		assert_noop!(Escrow::claim(signed(BENEFICIARY), id), Error::<Test>::NoClaim);
+	});
+}
+
+// The flaw the claim flow exists for: a payer who stalls until the deadline and refunds.
+#[test]
+fn a_pending_claim_blocks_the_payers_refund() {
+	run(|| {
+		let id = open(&[100], Some(ARBITER), 10);
+		System::set_block_number(9);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		System::set_block_number(10);
+		assert_noop!(Escrow::refund(signed(PAYER), id), Error::<Test>::ClaimPending);
+		System::set_block_number(9 + CHALLENGE_PERIOD);
+		assert_ok!(Escrow::claim(signed(BENEFICIARY), id));
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 100);
+	});
+}
+
+#[test]
+fn dispute_only_by_the_payer_within_the_challenge_period() {
+	run(|| {
+		let id = open(&[100], Some(ARBITER), 10);
+		assert_noop!(Escrow::dispute(signed(PAYER), id), Error::<Test>::NoClaim);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		for who in [BENEFICIARY, ARBITER, STRANGER] {
+			assert_noop!(Escrow::dispute(signed(who), id), Error::<Test>::NotAuthorized);
+		}
+		System::set_block_number(1 + CHALLENGE_PERIOD);
+		assert_noop!(Escrow::dispute(signed(PAYER), id), Error::<Test>::ChallengeOver);
+	});
+}
+
+#[test]
+fn a_disputed_claim_waits_for_the_arbiter() {
+	run(|| {
+		let id = open(&[100, 50], Some(ARBITER), 10);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_ok!(Escrow::dispute(signed(PAYER), id));
+		assert_noop!(Escrow::dispute(signed(PAYER), id), Error::<Test>::AlreadyDisputed);
+		System::set_block_number(20);
+		assert_noop!(Escrow::claim(signed(BENEFICIARY), id), Error::<Test>::Disputed);
+		assert_noop!(Escrow::refund(signed(PAYER), id), Error::<Test>::ClaimPending);
+		assert_eq!(
+			Escrows::<Test>::get(id).unwrap().claim,
+			Some(Claim { submitted: 1, disputed: true })
+		);
+	});
+}
+
+#[test]
+fn resolve_splits_the_milestone() {
+	run(|| {
+		let id = open(&[100, 50], Some(ARBITER), 10);
+		assert_noop!(Escrow::resolve(signed(ARBITER), id, 60), Error::<Test>::NotDisputed);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_noop!(Escrow::resolve(signed(ARBITER), id, 60), Error::<Test>::NotDisputed);
+		assert_ok!(Escrow::dispute(signed(PAYER), id));
+		assert_noop!(Escrow::resolve(signed(PAYER), id, 60), Error::<Test>::NotAuthorized);
+
+		assert_ok!(Escrow::resolve(signed(ARBITER), id, 60));
+		System::assert_last_event(
+			Event::Resolved { id, index: 0, to_beneficiary: 60, to_payer: 40 }.into(),
+		);
+		assert_eq!(free(BENEFICIARY), START_BALANCE + 60);
+		assert_eq!(free(PAYER), START_BALANCE - 150 - DEPOSIT + 40);
+		let escrow = Escrows::<Test>::get(id).unwrap();
+		assert_eq!((escrow.released, escrow.remaining, escrow.claim), (1, 50, None));
+	});
+}
+
+#[test]
+fn resolve_rejects_shares_below_the_minimum() {
+	run(|| {
+		let id = open(&[100], Some(ARBITER), 10);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_ok!(Escrow::dispute(signed(PAYER), id));
+		for share in [101, MIN_MILESTONE - 1, 100 - MIN_MILESTONE + 1] {
+			assert_noop!(Escrow::resolve(signed(ARBITER), id, share), Error::<Test>::InvalidSplit);
+		}
+		// All to one side is always a valid split, and the last milestone closes the escrow.
+		assert_ok!(Escrow::resolve(signed(ARBITER), id, 0));
+		assert_eq!(free(PAYER), START_BALANCE);
+		assert!(Escrows::<Test>::get(id).is_none());
+	});
+}
+
+#[test]
+fn release_settles_a_pending_claim() {
+	run(|| {
+		let id = open(&[100, 50], Some(ARBITER), 10);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		assert_ok!(Escrow::dispute(signed(PAYER), id));
+		assert_ok!(Escrow::release(signed(PAYER), id));
+		assert_eq!(Escrows::<Test>::get(id).unwrap().claim, None);
+		assert_ok!(Escrow::submit(signed(BENEFICIARY), id));
+		System::assert_last_event(Event::Submitted { id, index: 1 }.into());
 	});
 }
 
@@ -325,4 +431,79 @@ fn hold_outliving_the_last_escrow_is_caught() {
 fn integrity_test_passes_for_mock_config() {
 	use frame_support::traits::Hooks;
 	crate::Pallet::<Test>::integrity_test();
+}
+
+mod migration {
+	use super::*;
+	use crate::{
+		migrations::v1::{self, OldEscrowInfo},
+		HoldReason,
+	};
+	use frame_support::traits::{
+		fungible::{InspectHold, MutateHold},
+		GetStorageVersion, OnRuntimeUpgrade, StorageVersion,
+	};
+
+	/// Write an escrow the way the hold-based pallet stored it.
+	fn old_escrow(id: u32, milestones: &[u64], released: u32, deposit: u64) {
+		let remaining: u64 = milestones[released as usize..].iter().sum();
+		assert_ok!(Balances::hold(&HoldReason::Escrow.into(), &PAYER, remaining));
+		assert_ok!(Balances::hold(&HoldReason::StorageDeposit.into(), &PAYER, deposit));
+		v1::Escrows::<Test>::insert(
+			id,
+			OldEscrowInfo::<Test> {
+				payer: PAYER,
+				beneficiary: BENEFICIARY,
+				arbiter: Some(ARBITER),
+				milestones: milestones.to_vec().try_into().unwrap(),
+				released,
+				remaining,
+				deposit,
+				deadline: 30,
+			},
+		);
+		v1::EscrowCount::<Test>::mutate(PAYER, |n| *n += 1);
+	}
+
+	#[test]
+	fn moves_holds_into_escrow_accounts() {
+		new_test_ext().execute_with(|| {
+			StorageVersion::new(0).put::<crate::Pallet<Test>>();
+			old_escrow(0, &[100, 50], 1, DEPOSIT);
+			// Version 0 allowed a deposit below the existential deposit.
+			old_escrow(1, &[200], 0, 0);
+			NextEscrowId::<Test>::put(2);
+
+			v1::MigrateToV1::<Test>::on_runtime_upgrade();
+
+			assert_eq!(crate::Pallet::<Test>::on_chain_storage_version(), 1);
+			for reason in [HoldReason::Escrow, HoldReason::StorageDeposit] {
+				assert_eq!(Balances::balance_on_hold(&reason.into(), &PAYER), 0);
+			}
+			assert!(v1::EscrowCount::<Test>::iter().next().is_none());
+			assert_eq!(in_escrow(0), 50 + DEPOSIT);
+			let ed = <Balances as frame_support::traits::fungible::Inspect<_>>::minimum_balance();
+			assert_eq!(in_escrow(1), 200 + ed);
+			let first = Escrows::<Test>::get(0).unwrap();
+			assert_eq!(first.milestones, ms(&[(100, 30), (50, 30)]));
+			assert_eq!((first.released, first.remaining, first.claim), (1, 50, None));
+			Escrow::do_try_state().unwrap();
+
+			// Migrated escrows behave like new ones.
+			assert_ok!(Escrow::release(signed(PAYER), 0));
+			assert_ok!(Escrow::cancel(signed(BENEFICIARY), 1));
+			// Only the second milestone of escrow 0 was still owed; everything else came back.
+			assert_eq!(free(PAYER), START_BALANCE - 50);
+		});
+	}
+
+	#[test]
+	fn runs_once() {
+		new_test_ext().execute_with(|| {
+			assert_eq!(crate::Pallet::<Test>::on_chain_storage_version(), 1);
+			let id = open(&[100], None, 10);
+			v1::MigrateToV1::<Test>::on_runtime_upgrade();
+			assert!(Escrows::<Test>::get(id).is_some());
+		});
+	}
 }

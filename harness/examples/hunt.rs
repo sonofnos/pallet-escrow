@@ -1,10 +1,10 @@
 //! Print every class of spec violation the harness finds, with a shrunk reproduction.
 //!
-//! cargo run --release -p escrow-harness --example hunt -- v0 20000
+//! cargo run --release -p escrow-harness --example hunt -- v0 20000    # or v1, v2
 
 use escrow_harness::{
 	hunt, quiet_panics,
-	runtimes::{fixed::Fixed, v0::V0},
+	runtimes::{v0::V0, v1::V1, v2::V2},
 	Finding,
 };
 
@@ -16,8 +16,9 @@ fn main() {
 
 	let findings: Vec<Finding> = match target.as_str() {
 		"v0" => hunt::<V0>(seeds),
-		"fixed" => hunt::<Fixed>(seeds),
-		other => panic!("unknown target {other}, use v0 or fixed"),
+		"v1" => hunt::<V1>(seeds),
+		"v2" => hunt::<V2>(seeds),
+		other => panic!("unknown target {other}, use v0, v1 or v2"),
 	};
 
 	println!("{target}: {seeds} seeded sequences, {} violation classes", findings.len());

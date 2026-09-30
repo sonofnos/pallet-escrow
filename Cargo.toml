@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["pallets/escrow", "pallets/escrow-v0", "harness"]
+members = ["pallets/escrow", "pallets/escrow-v1", "pallets/escrow-v0", "harness"]
 exclude = ["fuzz"]
 
 [workspace.package]
@@ -23,4 +23,5 @@ sp-runtime = { version = "48.0.0", default-features = false }
 arbitrary = { version = "1.3", features = ["derive"] }
 
 pallet-escrow = { path = "pallets/escrow", default-features = false }
+pallet-escrow-v1 = { path = "pallets/escrow-v1", default-features = false }
 pallet-escrow-v0 = { path = "pallets/escrow-v0", default-features = false }

@@ -5,8 +5,8 @@
 //! escrow storage and events. The driver then holds the pallet to four rules:
 //!
 //! 1. A call the spec gives no reason to reject must return `Ok` and have exactly the spec's
-//!    effect on every account's free balance and both hold balances, on the stored escrows and
-//!    on the events emitted.
+//!    effect on every account's free balance, the funds escrowed on its behalf and its storage
+//!    deposits, on the stored escrows and on the events emitted.
 //! 2. A call the spec rejects must return `Err` with an error that is one of the spec's reasons,
 //!    and change nothing.
 //! 3. No call may panic, and total issuance never changes.
@@ -15,9 +15,13 @@
 //! Rule 1 is what makes the oracle two-sided: a pallet that refuses a call it owes the caller
 //! (funds that can never be paid out or refunded) fails it as surely as one that pays the wrong
 //! account.
+//!
+//! One spec covers every target. The classic targets (`v0`, `v1`) have no claims and a single
+//! deadline per escrow; the driver never sends them claim calls and gives all of an escrow's
+//! milestones the same deadline, and on that subset the claim rules never apply.
 
 use arbitrary::Arbitrary;
-use sp_runtime::{DispatchError, DispatchResult, ModuleError};
+use sp_runtime::{ArithmeticError, DispatchError, DispatchResult, ModuleError};
 use std::{
 	collections::BTreeMap,
 	fmt,
@@ -25,14 +29,17 @@ use std::{
 	sync::atomic::{AtomicU64, Ordering},
 };
 
-/// Calls executed, as `[ok, err]` for create, release, refund, cancel. Reported next to the
-/// results so a clean run can be told apart from a run that never reached deep states.
-static CALLS: [[AtomicU64; 2]; 4] = [
-	[AtomicU64::new(0), AtomicU64::new(0)],
-	[AtomicU64::new(0), AtomicU64::new(0)],
-	[AtomicU64::new(0), AtomicU64::new(0)],
-	[AtomicU64::new(0), AtomicU64::new(0)],
-];
+use crate::runtimes::{ACCOUNTS, START_BALANCE};
+
+/// Amounts in the spec. Targets with narrower balances say so in [`SpecParams::max_balance`].
+pub type Balance = u128;
+
+const CALL_NAMES: [&str; 8] =
+	["create", "release", "refund", "cancel", "submit", "dispute", "claim", "resolve"];
+
+/// Calls executed, as `[ok, err]` per entry of `CALL_NAMES`. Reported next to the results so a
+/// clean run can be told apart from a run that never reached deep states.
+static CALLS: [[AtomicU64; 2]; 8] = [const { [AtomicU64::new(0), AtomicU64::new(0)] }; 8];
 
 /// Reset the call counters.
 pub fn reset_coverage() {
@@ -41,7 +48,7 @@ pub fn reset_coverage() {
 
 /// One line per call kind: how many succeeded and how many were rejected.
 pub fn coverage() -> String {
-	["create", "release", "refund", "cancel"]
+	CALL_NAMES
 		.iter()
 		.zip(CALLS.iter())
 		.map(|(name, [ok, err])| {
@@ -55,20 +62,39 @@ pub fn coverage() -> String {
 		.join("\n")
 }
 
-use crate::runtimes::{ACCOUNTS, START_BALANCE};
+/// Where a target keeps escrowed funds. It decides only when the payer can afford an escrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Custody {
+	/// On hold on the payer's account.
+	Hold,
+	/// Moved into an account of the escrow's own.
+	Account,
+}
 
 /// Limits the spec is checked against. They mirror each target's pallet configuration.
 #[derive(Clone, Copy, Debug)]
 pub struct SpecParams {
-	pub min_milestone: u64,
-	pub deposit: u64,
+	pub min_milestone: Balance,
+	pub deposit: Balance,
 	pub max_milestones: usize,
-	pub existential_deposit: u64,
+	pub existential_deposit: Balance,
+	pub max_balance: Balance,
+	pub custody: Custody,
+	/// Whether the target has `submit`, `dispute`, `claim` and `resolve`.
+	pub claims: bool,
+	pub challenge_period: u64,
 }
 
 /// Returned by a target for a `create` whose milestones exceed the bound: such a call never
 /// decodes, so it cannot reach the pallet.
 pub const UNDECODABLE: &str = "call does not decode: too many milestones";
+
+/// A claim on an escrow's next milestone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Claim {
+	pub submitted: u64,
+	pub disputed: bool,
+}
 
 /// An escrow as the spec sees it. Targets report their storage in this shape.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,21 +102,31 @@ pub struct Record {
 	pub payer: u64,
 	pub beneficiary: u64,
 	pub arbiter: Option<u64>,
-	pub milestones: Vec<u64>,
+	/// `(amount, deadline)`.
+	pub milestones: Vec<(Balance, u64)>,
 	pub released: u32,
-	pub remaining: u64,
-	pub deposit: u64,
-	pub deadline: u64,
+	pub remaining: Balance,
+	pub deposit: Balance,
+	pub claim: Option<Claim>,
+}
+
+impl Record {
+	fn next(&self) -> (Balance, u64) {
+		self.milestones[self.released as usize]
+	}
 }
 
 /// The pallet's events, as the spec sees them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpecEvent {
-	Created { id: u32, payer: u64, beneficiary: u64, total: u64 },
-	MilestoneReleased { id: u32, index: u32, amount: u64 },
+	Created { id: u32, payer: u64, beneficiary: u64, total: Balance },
+	MilestoneReleased { id: u32, index: u32, amount: Balance },
 	Completed { id: u32 },
-	Refunded { id: u32, amount: u64 },
-	Cancelled { id: u32, amount: u64 },
+	Refunded { id: u32, amount: Balance },
+	Cancelled { id: u32, amount: Balance },
+	Submitted { id: u32, index: u32 },
+	Disputed { id: u32, index: u32 },
+	Resolved { id: u32, index: u32, to_beneficiary: Balance, to_payer: Balance },
 }
 
 /// A pallet under test, wrapped in its own mock runtime.
@@ -99,22 +135,39 @@ pub trait Target {
 	const PARAMS: SpecParams;
 
 	fn new_ext() -> sp_io::TestExternalities;
+	/// Milestones are `(amount, deadline)`. A classic target takes `deadline` and the amounts.
 	fn create(
 		payer: u64,
 		beneficiary: u64,
 		arbiter: Option<u64>,
-		milestones: Vec<u64>,
+		milestones: Vec<(Balance, u64)>,
 		deadline: u64,
 	) -> DispatchResult;
 	fn release(who: u64, id: u32) -> DispatchResult;
 	fn refund(who: u64, id: u32) -> DispatchResult;
 	fn cancel(who: u64, id: u32) -> DispatchResult;
+	fn submit(_who: u64, _id: u32) -> DispatchResult {
+		unreachable!("{} has no claims", Self::NAME)
+	}
+	fn dispute(_who: u64, _id: u32) -> DispatchResult {
+		unreachable!("{} has no claims", Self::NAME)
+	}
+	fn claim(_who: u64, _id: u32) -> DispatchResult {
+		unreachable!("{} has no claims", Self::NAME)
+	}
+	fn resolve(_who: u64, _id: u32, _to_beneficiary: Balance) -> DispatchResult {
+		unreachable!("{} has no claims", Self::NAME)
+	}
 	fn block() -> u64;
 	fn set_block(n: u64);
-	fn free(who: u64) -> u64;
-	fn held_escrow(who: u64) -> u64;
-	fn held_deposit(who: u64) -> u64;
-	fn total_issuance() -> u64;
+	fn free(who: u64) -> Balance;
+	/// Funds escrowed on `who`'s behalf, wherever the target keeps them.
+	fn escrowed(who: u64) -> Balance;
+	/// Storage deposits paid by `who` for live escrows.
+	fn deposits(who: u64) -> Balance;
+	/// The ledger's `(frozen, reserved)` for `who`, which bound what it can escrow.
+	fn ledger(who: u64) -> (Balance, Balance);
+	fn total_issuance() -> Balance;
 	fn next_id() -> u32;
 	fn escrows() -> BTreeMap<u32, Record>;
 	/// Escrow events since the last [`Target::reset_events`], or `None` if this target's events
@@ -122,10 +175,10 @@ pub trait Target {
 	fn events() -> Option<Vec<SpecEvent>>;
 	fn reset_events();
 	/// Set or replace the one lock another pallet keeps on `who`.
-	fn lock(who: u64, amount: u64);
+	fn lock(who: u64, amount: Balance);
 	fn unlock(who: u64);
 	/// A plain transfer outside the escrow pallet. It may fail; the spec does not care.
-	fn transfer(from: u64, to: u64, amount: u64);
+	fn transfer(from: u64, to: u64, amount: Balance);
 	/// The pallet's own invariant check, if it has one.
 	fn try_state() -> Result<(), String> {
 		Ok(())
@@ -143,11 +196,22 @@ pub enum Reason {
 	TooManyMilestones,
 	MilestoneTooSmall,
 	DeadlineInPast,
+	DeadlinesOutOfOrder,
 	DeadlineNotReached,
 	Overflow,
-	/// The payer cannot put the escrow on hold without going below what the ledger requires
-	/// them to keep.
+	/// The payer cannot fund the escrow without going below what the ledger requires them to
+	/// keep.
 	Funds,
+	NoArbiter,
+	ClaimPending,
+	DeadlinePassed,
+	NoClaim,
+	AlreadyDisputed,
+	ChallengeOver,
+	Disputed,
+	ChallengeNotOver,
+	NotDisputed,
+	InvalidSplit,
 }
 
 impl Reason {
@@ -161,13 +225,24 @@ impl Reason {
 			Reason::TooManyMilestones => "more milestones than the bound".into(),
 			Reason::MilestoneTooSmall => "milestone below minimum".into(),
 			Reason::DeadlineInPast => "deadline not in the future".into(),
+			Reason::DeadlinesOutOfOrder => "deadlines out of order".into(),
 			Reason::DeadlineNotReached => "payer refunded before the deadline".into(),
 			Reason::Overflow => "milestone total overflows".into(),
 			Reason::Funds => "payer cannot afford it".into(),
+			Reason::NoArbiter => "no arbiter to settle a dispute".into(),
+			Reason::ClaimPending => "a claim is pending".into(),
+			Reason::DeadlinePassed => "the milestone's deadline has passed".into(),
+			Reason::NoClaim => "nothing was submitted".into(),
+			Reason::AlreadyDisputed => "the claim is already disputed".into(),
+			Reason::ChallengeOver => "the challenge period is over".into(),
+			Reason::Disputed => "the claim is disputed".into(),
+			Reason::ChallengeNotOver => "the challenge period is still running".into(),
+			Reason::NotDisputed => "nothing is disputed".into(),
+			Reason::InvalidSplit => "the split is invalid".into(),
 		}
 	}
 
-	/// The reason a dispatch error stands for. Both pallets name their errors the same way.
+	/// The reason a dispatch error stands for. The pallets name their errors the same way.
 	fn of(err: DispatchError) -> Option<Reason> {
 		match err {
 			DispatchError::Module(ModuleError { message: Some(name), .. }) => match name {
@@ -178,33 +253,49 @@ impl Reason {
 				"NoMilestones" => Some(Reason::NoMilestones),
 				"MilestoneTooSmall" => Some(Reason::MilestoneTooSmall),
 				"DeadlineInPast" => Some(Reason::DeadlineInPast),
+				"DeadlinesOutOfOrder" => Some(Reason::DeadlinesOutOfOrder),
 				"DeadlineNotReached" => Some(Reason::DeadlineNotReached),
 				"Overflow" => Some(Reason::Overflow),
+				"NoArbiter" => Some(Reason::NoArbiter),
+				"ClaimPending" => Some(Reason::ClaimPending),
+				"DeadlinePassed" => Some(Reason::DeadlinePassed),
+				"NoClaim" => Some(Reason::NoClaim),
+				"AlreadyDisputed" => Some(Reason::AlreadyDisputed),
+				"ChallengeOver" => Some(Reason::ChallengeOver),
+				"Disputed" => Some(Reason::Disputed),
+				"ChallengeNotOver" => Some(Reason::ChallengeNotOver),
+				"NotDisputed" => Some(Reason::NotDisputed),
+				"InvalidSplit" => Some(Reason::InvalidSplit),
 				_ => None,
 			},
 			DispatchError::Token(_) => Some(Reason::Funds),
+			// The ledger checks an amount against total issuance before the payer's balance.
+			DispatchError::Arithmetic(ArithmeticError::Underflow) => Some(Reason::Funds),
 			DispatchError::Other(UNDECODABLE) => Some(Reason::TooManyMilestones),
 			_ => None,
 		}
 	}
 }
 
-/// A milestone amount: usually realistic, about 3% of the time close to `u64::MAX` so that
-/// overflow is reachable without drowning every sequence in it.
+/// A milestone: usually a realistic amount, about 3% of the time close to the target's maximum
+/// balance so that overflow is reachable without drowning every sequence in it.
 #[derive(Arbitrary, Clone, Copy, Debug)]
 pub struct Amount {
 	pub value: u16,
 	pub huge: u8,
+	/// Blocks between this milestone's deadline and the previous one's, for targets with a
+	/// deadline per milestone.
+	pub gap: u8,
 }
 
 impl Amount {
-	fn value(self, well_formed: bool, min: u64) -> u64 {
+	fn value(self, well_formed: bool, p: SpecParams) -> Balance {
 		if self.huge < 8 {
-			u64::MAX - u64::from(self.value)
+			p.max_balance - Balance::from(self.value)
 		} else if well_formed {
-			min + u64::from(self.value) % 1_500
+			p.min_milestone + Balance::from(self.value) % 1_500
 		} else {
-			u64::from(self.value % 3_000)
+			Balance::from(self.value % 3_000)
 		}
 	}
 }
@@ -233,6 +324,25 @@ pub enum Action {
 	Cancel {
 		who: u8,
 		id: u8,
+	},
+	Submit {
+		who: u8,
+		id: u8,
+	},
+	Dispute {
+		who: u8,
+		id: u8,
+	},
+	Claim {
+		who: u8,
+		id: u8,
+	},
+	Resolve {
+		who: u8,
+		id: u8,
+		/// Nothing, everything, or a share that may be invalid.
+		split: u8,
+		share: u16,
 	},
 	Advance {
 		blocks: u8,
@@ -265,15 +375,32 @@ fn other_account(base: u64, n: u8) -> u64 {
 	(base + u64::from(n) % (ACCOUNTS - 1)) % ACCOUNTS + 1
 }
 
-/// Pick a caller by role in the escrow, so authorised and unauthorised calls both happen often.
-fn caller(who: u8, parties: Option<&(u64, u64, Option<u64>)>) -> u64 {
-	match (parties, who % 6) {
-		(Some((payer, _, _)), 0 | 1) => *payer,
-		(Some((_, beneficiary, _)), 2) => *beneficiary,
-		(Some((payer, beneficiary, arbiter)), 3) => arbiter.unwrap_or_else(|| {
-			(1..=ACCOUNTS).find(|a| a != payer && a != beneficiary).unwrap_or(1)
-		}),
-		_ => account(who / 6),
+#[derive(Clone, Copy)]
+enum Role {
+	Payer,
+	Beneficiary,
+	Arbiter,
+}
+
+/// Pick a caller by role in the escrow, most often the role the call is meant for, so that
+/// authorised and unauthorised calls both happen often.
+fn caller(who: u8, parties: Option<&(u64, u64, Option<u64>)>, role: Role) -> u64 {
+	let Some(&(payer, beneficiary, arbiter)) = parties else {
+		return account(who);
+	};
+	let third = arbiter
+		.unwrap_or_else(|| (1..=ACCOUNTS).find(|a| *a != payer && *a != beneficiary).unwrap_or(1));
+	let preferred = match role {
+		Role::Payer => payer,
+		Role::Beneficiary => beneficiary,
+		Role::Arbiter => third,
+	};
+	match who % 8 {
+		0..=2 => preferred,
+		3 => payer,
+		4 => beneficiary,
+		5 => third,
+		_ => account(who / 8),
 	}
 }
 
@@ -321,6 +448,10 @@ impl Violation {
 			Action::Release { .. } => "release",
 			Action::Refund { .. } => "refund",
 			Action::Cancel { .. } => "cancel",
+			Action::Submit { .. } => "submit",
+			Action::Dispute { .. } => "dispute",
+			Action::Claim { .. } => "claim",
+			Action::Resolve { .. } => "resolve",
 			Action::Advance { .. } => "advance",
 			Action::Lock { .. } => "lock",
 			Action::Unlock { .. } => "unlock",
@@ -358,13 +489,16 @@ impl fmt::Display for Violation {
 	}
 }
 
-/// Per-account `(free, escrow hold, deposit hold)`.
-type Balances = BTreeMap<u64, (u64, u64, u64)>;
+/// Per-account `(free, escrowed, deposits)`.
+type Balances = BTreeMap<u64, (Balance, Balance, Balance)>;
 
 /// Everything a call can change that the spec has an opinion on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
 	balances: Balances,
+	/// Per-account `(frozen, reserved)`: not the spec's business, except that they bound what
+	/// an account can escrow.
+	ledger: BTreeMap<u64, (Balance, Balance)>,
 	escrows: BTreeMap<u32, Record>,
 	next_id: u32,
 	events: Option<Vec<SpecEvent>>,
@@ -373,12 +507,18 @@ struct State {
 fn snapshot<T: Target>() -> State {
 	State {
 		balances: (1..=ACCOUNTS)
-			.map(|who| (who, (T::free(who), T::held_escrow(who), T::held_deposit(who))))
+			.map(|who| (who, (T::free(who), T::escrowed(who), T::deposits(who))))
 			.collect(),
+		ledger: (1..=ACCOUNTS).map(|who| (who, T::ledger(who))).collect(),
 		escrows: T::escrows(),
 		next_id: T::next_id(),
 		events: T::events(),
 	}
+}
+
+/// Amounts in the model are bounded by total issuance, far inside `i128`.
+fn signed(amount: Balance) -> i128 {
+	i128::try_from(amount).expect("model amounts are bounded by issuance")
 }
 
 /// Signed balance changes the spec expects from one successful call.
@@ -386,20 +526,23 @@ fn snapshot<T: Target>() -> State {
 struct Effect(BTreeMap<u64, (i128, i128, i128)>);
 
 impl Effect {
-	fn add(&mut self, who: u64, free: i128, held: i128, deposit: i128) {
+	fn add(&mut self, who: u64, free: i128, escrowed: i128, deposits: i128) {
 		let e = self.0.entry(who).or_default();
 		e.0 += free;
-		e.1 += held;
-		e.2 += deposit;
+		e.1 += escrowed;
+		e.2 += deposits;
 	}
 
 	fn apply(&self, before: &Balances) -> Option<Balances> {
+		let shift = |value: Balance, by: i128| {
+			i128::try_from(value).ok().and_then(|v| Balance::try_from(v + by).ok())
+		};
 		let mut out = before.clone();
-		for (who, (free, held, deposit)) in &self.0 {
+		for (who, (free, escrowed, deposits)) in &self.0 {
 			let row = out.get_mut(who)?;
-			row.0 = u64::try_from(i128::from(row.0) + free).ok()?;
-			row.1 = u64::try_from(i128::from(row.1) + held).ok()?;
-			row.2 = u64::try_from(i128::from(row.2) + deposit).ok()?;
+			row.0 = shift(row.0, *free)?;
+			row.1 = shift(row.1, *escrowed)?;
+			row.2 = shift(row.2, *deposits)?;
 		}
 		Some(out)
 	}
@@ -420,28 +563,42 @@ struct Model {
 	parties: BTreeMap<u32, (u64, u64, Option<u64>)>,
 }
 
-/// Whether `who` can move `amount` from free balance onto hold.
+/// Whether `who` can put `amount` into an escrow.
 ///
-/// The ledger lets an account hold funds as long as its free balance stays at or above the
-/// existential deposit.
-fn can_hold(balances: &Balances, who: u64, amount: u64, p: SpecParams) -> bool {
-	let (free, ..) = balances[&who];
-	amount.checked_add(p.existential_deposit).is_some_and(|need| free >= need)
+/// With [`Custody::Hold`] the ledger only asks that the free balance stay at or above the
+/// existential deposit: a lock covers held funds as well as free ones, so holding locked funds
+/// is allowed. With [`Custody::Account`] the funds leave the account, so the free balance that
+/// stays behind must also cover whatever part of the locks the account's holds do not.
+fn affordable(before: &State, who: u64, amount: Balance, p: SpecParams) -> bool {
+	let (free, ..) = before.balances[&who];
+	let (frozen, reserved) = before.ledger[&who];
+	let keep = match p.custody {
+		Custody::Hold => p.existential_deposit,
+		Custody::Account => p.existential_deposit.max(frozen.saturating_sub(reserved)),
+	};
+	amount.checked_add(keep).is_some_and(|need| free >= need)
 }
 
 impl Model {
+	fn from_storage<T: Target>() -> Self {
+		let escrows = T::escrows();
+		let parties =
+			escrows.iter().map(|(id, e)| (*id, (e.payer, e.beneficiary, e.arbiter))).collect();
+		Model { escrows, next_id: T::next_id(), parties }
+	}
+
 	/// What a call must do, or every reason the spec gives for rejecting it.
 	fn expect(
 		&self,
 		call: &Call,
 		block: u64,
 		p: SpecParams,
-		before: &Balances,
+		before: &State,
 	) -> Result<Expected, Vec<Reason>> {
 		let mut out = Expected::default();
+		let mut why = Vec::new();
 		match call {
 			Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
-				let mut why = Vec::new();
 				if payer == beneficiary {
 					why.push(Reason::SelfEscrow);
 				}
@@ -454,29 +611,35 @@ impl Model {
 				if milestones.len() > p.max_milestones {
 					why.push(Reason::TooManyMilestones);
 				}
-				if milestones.iter().any(|m| *m < p.min_milestone) {
+				if milestones.iter().any(|m| m.0 < p.min_milestone) {
 					why.push(Reason::MilestoneTooSmall);
 				}
-				if *deadline <= block {
+				if milestones.first().map_or(*deadline, |m| m.1) <= block {
 					why.push(Reason::DeadlineInPast);
 				}
-				let total = milestones.iter().try_fold(0u64, |acc, m| acc.checked_add(*m));
-				match total {
+				if milestones.windows(2).any(|w| w[0].1 > w[1].1) {
+					why.push(Reason::DeadlinesOutOfOrder);
+				}
+				let fits = |amount: &Balance| *amount <= p.max_balance;
+				let total = milestones
+					.iter()
+					.try_fold(0, |acc: Balance, m| acc.checked_add(m.0))
+					.filter(fits);
+				// Milestones that fit with a deposit that does not: no one can afford that, and
+				// a pallet may say either.
+				match total.map(|t| t.checked_add(p.deposit).filter(fits)) {
 					None => why.push(Reason::Overflow),
-					Some(total) => {
-						let affordable = total
-							.checked_add(p.deposit)
-							.is_some_and(|need| can_hold(before, *payer, need, p));
-						if !affordable {
-							why.push(Reason::Funds);
-						}
+					Some(None) => why.extend([Reason::Overflow, Reason::Funds]),
+					Some(Some(funding)) if !affordable(before, *payer, funding, p) => {
+						why.push(Reason::Funds)
 					},
+					Some(Some(_)) => {},
 				}
 				if !why.is_empty() {
 					return Err(why);
 				}
 				let total = total.expect("checked above");
-				let (t, d) = (i128::from(total), i128::from(p.deposit));
+				let (t, d) = (signed(total), signed(p.deposit));
 				out.effect.add(*payer, -(t + d), t, d);
 				out.events.push(SpecEvent::Created {
 					id: self.next_id,
@@ -484,84 +647,201 @@ impl Model {
 					beneficiary: *beneficiary,
 					total,
 				});
+				return Ok(out);
 			},
-			Call::Release { who, id } => {
-				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
-				if *who != e.payer && Some(*who) != e.arbiter {
-					return Err(vec![Reason::NotAuthorized]);
-				}
-				let index = e.released;
-				let amount = e.milestones[index as usize];
-				out.effect.add(e.payer, 0, -i128::from(amount), 0);
-				out.effect.add(e.beneficiary, i128::from(amount), 0, 0);
-				out.events.push(SpecEvent::MilestoneReleased { id: *id, index, amount });
-				if index as usize + 1 == e.milestones.len() {
-					let deposit = i128::from(e.deposit);
-					out.effect.add(e.payer, deposit, 0, -deposit);
-					out.events.push(SpecEvent::Completed { id: *id });
+			Call::Release { id, .. }
+			| Call::Refund { id, .. }
+			| Call::Cancel { id, .. }
+			| Call::Submit { id, .. }
+			| Call::Dispute { id, .. }
+			| Call::Claim { id, .. }
+			| Call::Resolve { id, .. }
+				if !self.escrows.contains_key(id) =>
+			{
+				return Err(vec![Reason::NotFound]);
+			},
+			_ => {},
+		}
+
+		let (id, who) = call.target();
+		let e = &self.escrows[&id];
+		let is = |party: Option<u64>| party == Some(who);
+		let (amount, deadline) = e.next();
+		let challenge_end = e.claim.map(|c| c.submitted + p.challenge_period);
+		match call {
+			Call::Create { .. } => unreachable!("handled above"),
+			Call::Release { .. } => {
+				if !is(Some(e.payer)) && !is(e.arbiter) {
+					why.push(Reason::NotAuthorized);
 				}
 			},
-			Call::Refund { who, id } => {
-				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
-				if Some(*who) != e.arbiter {
-					if *who != e.payer {
-						return Err(vec![Reason::NotAuthorized]);
+			Call::Refund { .. } if !is(e.arbiter) => {
+				if !is(Some(e.payer)) {
+					why.push(Reason::NotAuthorized);
+				} else {
+					if block < deadline {
+						why.push(Reason::DeadlineNotReached);
 					}
-					if block < e.deadline {
-						return Err(vec![Reason::DeadlineNotReached]);
+					if e.claim.is_some() {
+						why.push(Reason::ClaimPending);
 					}
 				}
-				Self::close(&mut out.effect, e);
-				out.events.push(SpecEvent::Refunded { id: *id, amount: e.remaining });
 			},
-			Call::Cancel { who, id } => {
-				let e = self.escrows.get(id).ok_or(vec![Reason::NotFound])?;
-				if *who != e.beneficiary {
-					return Err(vec![Reason::NotAuthorized]);
+			Call::Refund { .. } => {},
+			Call::Cancel { .. } => {
+				if !is(Some(e.beneficiary)) {
+					why.push(Reason::NotAuthorized);
 				}
-				Self::close(&mut out.effect, e);
-				out.events.push(SpecEvent::Cancelled { id: *id, amount: e.remaining });
 			},
+			Call::Submit { .. } => {
+				if !is(Some(e.beneficiary)) {
+					why.push(Reason::NotAuthorized);
+				}
+				if e.arbiter.is_none() {
+					why.push(Reason::NoArbiter);
+				}
+				if e.claim.is_some() {
+					why.push(Reason::ClaimPending);
+				}
+				if block >= deadline {
+					why.push(Reason::DeadlinePassed);
+				}
+			},
+			Call::Dispute { .. } => {
+				if !is(Some(e.payer)) {
+					why.push(Reason::NotAuthorized);
+				}
+				match e.claim {
+					None => why.push(Reason::NoClaim),
+					Some(claim) => {
+						if claim.disputed {
+							why.push(Reason::AlreadyDisputed);
+						}
+						if challenge_end.is_some_and(|end| block >= end) {
+							why.push(Reason::ChallengeOver);
+						}
+					},
+				}
+			},
+			Call::Claim { .. } => {
+				if !is(Some(e.beneficiary)) {
+					why.push(Reason::NotAuthorized);
+				}
+				match e.claim {
+					None => why.push(Reason::NoClaim),
+					Some(claim) => {
+						if claim.disputed {
+							why.push(Reason::Disputed);
+						}
+						if challenge_end.is_some_and(|end| block < end) {
+							why.push(Reason::ChallengeNotOver);
+						}
+					},
+				}
+			},
+			Call::Resolve { to_beneficiary, .. } => {
+				if !is(e.arbiter) {
+					why.push(Reason::NotAuthorized);
+				}
+				if !e.claim.is_some_and(|c| c.disputed) {
+					why.push(Reason::NotDisputed);
+				}
+				let valid = |share: Balance| share == 0 || share >= p.min_milestone;
+				if amount
+					.checked_sub(*to_beneficiary)
+					.is_none_or(|to_payer| !valid(*to_beneficiary) || !valid(to_payer))
+				{
+					why.push(Reason::InvalidSplit);
+				}
+			},
+		}
+		if !why.is_empty() {
+			return Err(why);
+		}
+
+		let index = e.released;
+		let last = index as usize + 1 == e.milestones.len();
+		let pay = |out: &mut Expected, to_beneficiary: Balance| {
+			let to_payer = amount - to_beneficiary;
+			out.effect.add(e.payer, signed(to_payer), -signed(amount), 0);
+			out.effect.add(e.beneficiary, signed(to_beneficiary), 0, 0);
+			if last {
+				let deposit = signed(e.deposit);
+				out.effect.add(e.payer, deposit, 0, -deposit);
+			}
+		};
+		match call {
+			Call::Release { .. } | Call::Claim { .. } => {
+				pay(&mut out, amount);
+				out.events.push(SpecEvent::MilestoneReleased { id, index, amount });
+			},
+			Call::Resolve { to_beneficiary, .. } => {
+				pay(&mut out, *to_beneficiary);
+				out.events.push(SpecEvent::Resolved {
+					id,
+					index,
+					to_beneficiary: *to_beneficiary,
+					to_payer: amount - to_beneficiary,
+				});
+			},
+			Call::Refund { .. } | Call::Cancel { .. } => {
+				let (remaining, deposit) = (signed(e.remaining), signed(e.deposit));
+				out.effect.add(e.payer, remaining + deposit, -remaining, -deposit);
+				out.events.push(if matches!(call, Call::Refund { .. }) {
+					SpecEvent::Refunded { id, amount: e.remaining }
+				} else {
+					SpecEvent::Cancelled { id, amount: e.remaining }
+				});
+				return Ok(out);
+			},
+			Call::Submit { .. } => out.events.push(SpecEvent::Submitted { id, index }),
+			Call::Dispute { .. } => out.events.push(SpecEvent::Disputed { id, index }),
+			Call::Create { .. } => unreachable!("handled above"),
+		}
+		if last && matches!(call, Call::Release { .. } | Call::Claim { .. } | Call::Resolve { .. })
+		{
+			out.events.push(SpecEvent::Completed { id });
 		}
 		Ok(out)
 	}
 
-	fn close(fx: &mut Effect, e: &Record) {
-		let (remaining, deposit) = (i128::from(e.remaining), i128::from(e.deposit));
-		fx.add(e.payer, remaining + deposit, -remaining, -deposit);
-	}
-
 	/// Record a successful call. Only called once the effect has been checked.
-	fn commit(&mut self, call: &Call, p: SpecParams) {
+	fn commit(&mut self, call: &Call, block: u64, p: SpecParams) {
+		if let Call::Create { payer, beneficiary, arbiter, milestones, .. } = call {
+			self.escrows.insert(
+				self.next_id,
+				Record {
+					payer: *payer,
+					beneficiary: *beneficiary,
+					arbiter: *arbiter,
+					milestones: milestones.clone(),
+					released: 0,
+					remaining: milestones.iter().map(|m| m.0).sum(),
+					deposit: p.deposit,
+					claim: None,
+				},
+			);
+			self.parties.insert(self.next_id, (*payer, *beneficiary, *arbiter));
+			self.next_id += 1;
+			return;
+		}
+		let (id, _) = call.target();
+		let e = self.escrows.get_mut(&id).expect("checked in expect");
 		match call {
-			Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
-				self.escrows.insert(
-					self.next_id,
-					Record {
-						payer: *payer,
-						beneficiary: *beneficiary,
-						arbiter: *arbiter,
-						milestones: milestones.clone(),
-						released: 0,
-						remaining: milestones.iter().sum(),
-						deposit: p.deposit,
-						deadline: *deadline,
-					},
-				);
-				self.parties.insert(self.next_id, (*payer, *beneficiary, *arbiter));
-				self.next_id += 1;
-			},
-			Call::Release { id, .. } => {
-				let e = self.escrows.get_mut(id).expect("checked in expect");
-				e.remaining -= e.milestones[e.released as usize];
+			Call::Release { .. } | Call::Claim { .. } | Call::Resolve { .. } => {
+				e.remaining -= e.next().0;
 				e.released += 1;
+				e.claim = None;
 				if e.released as usize == e.milestones.len() {
-					self.escrows.remove(id);
+					self.escrows.remove(&id);
 				}
 			},
-			Call::Refund { id, .. } | Call::Cancel { id, .. } => {
-				self.escrows.remove(id);
+			Call::Refund { .. } | Call::Cancel { .. } => {
+				self.escrows.remove(&id);
 			},
+			Call::Submit { .. } => e.claim = Some(Claim { submitted: block, disputed: false }),
+			Call::Dispute { .. } => e.claim.as_mut().expect("checked in expect").disputed = true,
+			Call::Create { .. } => unreachable!("handled above"),
 		}
 	}
 }
@@ -573,7 +853,7 @@ enum Call {
 		payer: u64,
 		beneficiary: u64,
 		arbiter: Option<u64>,
-		milestones: Vec<u64>,
+		milestones: Vec<(Balance, u64)>,
 		deadline: u64,
 	},
 	Release {
@@ -588,6 +868,67 @@ enum Call {
 		who: u64,
 		id: u32,
 	},
+	Submit {
+		who: u64,
+		id: u32,
+	},
+	Dispute {
+		who: u64,
+		id: u32,
+	},
+	Claim {
+		who: u64,
+		id: u32,
+	},
+	Resolve {
+		who: u64,
+		id: u32,
+		to_beneficiary: Balance,
+	},
+}
+
+impl Call {
+	/// The escrow and caller of any call but `Create`.
+	fn target(&self) -> (u32, u64) {
+		match *self {
+			Call::Release { who, id }
+			| Call::Refund { who, id }
+			| Call::Cancel { who, id }
+			| Call::Submit { who, id }
+			| Call::Dispute { who, id }
+			| Call::Claim { who, id }
+			| Call::Resolve { who, id, .. } => (id, who),
+			Call::Create { .. } => unreachable!("create has no escrow yet"),
+		}
+	}
+
+	fn index(&self) -> usize {
+		match self {
+			Call::Create { .. } => 0,
+			Call::Release { .. } => 1,
+			Call::Refund { .. } => 2,
+			Call::Cancel { .. } => 3,
+			Call::Submit { .. } => 4,
+			Call::Dispute { .. } => 5,
+			Call::Claim { .. } => 6,
+			Call::Resolve { .. } => 7,
+		}
+	}
+
+	fn dispatch<T: Target>(&self) -> DispatchResult {
+		match self {
+			Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
+				T::create(*payer, *beneficiary, *arbiter, milestones.clone(), *deadline)
+			},
+			Call::Release { who, id } => T::release(*who, *id),
+			Call::Refund { who, id } => T::refund(*who, *id),
+			Call::Cancel { who, id } => T::cancel(*who, *id),
+			Call::Submit { who, id } => T::submit(*who, *id),
+			Call::Dispute { who, id } => T::dispute(*who, *id),
+			Call::Claim { who, id } => T::claim(*who, *id),
+			Call::Resolve { who, id, to_beneficiary } => T::resolve(*who, *id, *to_beneficiary),
+		}
+	}
 }
 
 thread_local! {
@@ -609,102 +950,176 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 	}
 }
 
+/// Turn an action into a call against the model's current state, or perform it directly if it
+/// is not a pallet call. `None` means there is nothing to check.
+fn resolve_action<T: Target>(action: &Action, model: &Model, block: u64) -> Option<Call> {
+	let p = T::PARAMS;
+	let span = model.next_id + 1;
+	// Three in four calls go to a live escrow where the call can matter (a claim to dispute, a
+	// dispute to resolve), so that claims get that far; the rest to any id, closed and
+	// never-created ones included.
+	let pick = |who: u8, id: u8, role, fits: fn(&Record) -> bool| {
+		let live: Vec<u32> = model.escrows.keys().copied().collect();
+		let fitting: Vec<u32> =
+			live.iter().copied().filter(|id| fits(&model.escrows[id])).collect();
+		let from = if fitting.is_empty() { &live } else { &fitting };
+		let id = match id % 4 {
+			0 => u32::from(id) % span,
+			_ if from.is_empty() => u32::from(id) % span,
+			_ => from[usize::from(id / 4) % from.len()],
+		};
+		(caller(who, model.parties.get(&id), role), id)
+	};
+	let any = |_: &Record| true;
+	let claimed = |e: &Record| e.claim.is_some();
+	Some(match action.clone() {
+		// Short steps: deadlines are at most a few dozen blocks out and challenge periods shorter.
+		Action::Advance { blocks } => {
+			T::set_block(block + u64::from(blocks % 6));
+			return None;
+		},
+		Action::Lock { who, amount } => {
+			T::lock(account(who), Balance::from(amount) % (2 * Balance::from(START_BALANCE)));
+			return None;
+		},
+		Action::Unlock { who } => {
+			T::unlock(account(who));
+			return None;
+		},
+		Action::Spend { who, to, amount, mode } => {
+			let (from, free) = (account(who), T::free(account(who)));
+			let amount = match mode % 3 {
+				0 => Balance::from(amount) % (free + 1),
+				1 => free.saturating_sub(p.existential_deposit),
+				_ => free,
+			};
+			T::transfer(from, other_account(from, to), amount);
+			return None;
+		},
+		Action::Submit { .. }
+		| Action::Dispute { .. }
+		| Action::Claim { .. }
+		| Action::Resolve { .. }
+			if !p.claims =>
+		{
+			return None;
+		},
+		Action::Create { payer, beneficiary, arbiter, milestones, deadline_in, shape } => {
+			let well_formed = shape % 4 != 0;
+			let payer = account(payer);
+			let generated = milestones.iter().take(MAX_MILESTONES_GENERATED);
+			if well_formed {
+				let beneficiary = other_account(payer, beneficiary);
+				let deadline = block + 1 + u64::from(deadline_in % 20);
+				let mut at = deadline;
+				let mut amounts: Vec<(Balance, u64)> = generated
+					.map(|m| {
+						if p.claims {
+							at += u64::from(m.gap % 8);
+						}
+						(m.value(true, p), at)
+					})
+					.collect();
+				amounts.truncate(p.max_milestones);
+				if amounts.is_empty() {
+					amounts.push((p.min_milestone, deadline));
+				}
+				let third_parties: Vec<u64> =
+					(1..=ACCOUNTS).filter(|x| *x != payer && *x != beneficiary).collect();
+				Call::Create {
+					payer,
+					beneficiary,
+					arbiter: arbiter.map(|a| third_parties[usize::from(a) % third_parties.len()]),
+					deadline: amounts[0].1,
+					milestones: amounts,
+				}
+			} else {
+				// Spans a little into the past so past deadlines are exercised too.
+				let deadline = (block + u64::from(deadline_in % 24)).saturating_sub(2);
+				let amounts = generated
+					.map(|m| {
+						let at = if p.claims {
+							(deadline + u64::from(m.gap % 12)).saturating_sub(4)
+						} else {
+							deadline
+						};
+						(m.value(false, p), at)
+					})
+					.collect();
+				Call::Create {
+					payer,
+					beneficiary: account(beneficiary),
+					arbiter: arbiter.map(account),
+					milestones: amounts,
+					deadline,
+				}
+			}
+		},
+		Action::Release { who, id } => {
+			let (who, id) = pick(who, id, Role::Payer, any);
+			Call::Release { who, id }
+		},
+		Action::Refund { who, id } => {
+			let (who, id) = pick(who, id, Role::Payer, any);
+			Call::Refund { who, id }
+		},
+		Action::Cancel { who, id } => {
+			let (who, id) = pick(who, id, Role::Beneficiary, any);
+			Call::Cancel { who, id }
+		},
+		Action::Submit { who, id } => {
+			let (who, id) =
+				pick(who, id, Role::Beneficiary, |e| e.arbiter.is_some() && e.claim.is_none());
+			Call::Submit { who, id }
+		},
+		Action::Dispute { who, id } => {
+			let (who, id) = pick(who, id, Role::Payer, claimed);
+			Call::Dispute { who, id }
+		},
+		Action::Claim { who, id } => {
+			let (who, id) = pick(who, id, Role::Beneficiary, claimed);
+			Call::Claim { who, id }
+		},
+		Action::Resolve { who, id, split, share } => {
+			let (who, id) = pick(who, id, Role::Arbiter, |e| e.claim.is_some_and(|c| c.disputed));
+			let amount = model.escrows.get(&id).map_or(Balance::from(share), |e| e.next().0);
+			let to_beneficiary = match split % 3 {
+				0 => 0,
+				1 => amount,
+				_ => Balance::from(share) % (amount + 1),
+			};
+			Call::Resolve { who, id, to_beneficiary }
+		},
+	})
+}
+
 /// Run one call sequence against a fresh chain and return the first spec violation, if any.
 pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
-	let mut ext = T::new_ext();
+	run_in::<T>(&mut T::new_ext(), actions)
+}
+
+/// Run a call sequence against a chain in any state. The model takes the escrows already stored
+/// as given; everything from here on is held to the spec.
+pub fn run_in<T: Target>(
+	ext: &mut sp_io::TestExternalities,
+	actions: &[Action],
+) -> Result<(), Violation> {
 	ext.execute_with(|| {
 		let issuance = T::total_issuance();
-		let mut model = Model::default();
+		let mut model = Model::from_storage::<T>();
 
 		for (step, action) in actions.iter().take(MAX_ACTIONS).enumerate() {
 			let fail =
 				|kind, detail: String| Violation { step, action: action.clone(), kind, detail };
 			let block = T::block();
-			let span = model.next_id + 1;
-			let call = match action.clone() {
-				Action::Advance { blocks } => {
-					T::set_block(block + u64::from(blocks));
-					continue;
-				},
-				Action::Lock { who, amount } => {
-					T::lock(account(who), u64::from(amount) % (2 * START_BALANCE));
-					continue;
-				},
-				Action::Unlock { who } => {
-					T::unlock(account(who));
-					continue;
-				},
-				Action::Spend { who, to, amount, mode } => {
-					let (from, free) = (account(who), T::free(account(who)));
-					let amount = match mode % 3 {
-						0 => u64::from(amount) % (free + 1),
-						1 => free.saturating_sub(T::PARAMS.existential_deposit),
-						_ => free,
-					};
-					T::transfer(from, other_account(from, to), amount);
-					continue;
-				},
-				Action::Create { payer, beneficiary, arbiter, milestones, deadline_in, shape } => {
-					let well_formed = shape % 4 != 0;
-					let min = T::PARAMS.min_milestone;
-					let payer = account(payer);
-					let mut amounts: Vec<u64> = milestones
-						.iter()
-						.take(MAX_MILESTONES_GENERATED)
-						.map(|m| m.value(well_formed, min))
-						.collect();
-					if well_formed {
-						let beneficiary = other_account(payer, beneficiary);
-						amounts.truncate(T::PARAMS.max_milestones);
-						if amounts.is_empty() {
-							amounts.push(min);
-						}
-						let third_parties: Vec<u64> =
-							(1..=ACCOUNTS).filter(|x| *x != payer && *x != beneficiary).collect();
-						Call::Create {
-							payer,
-							beneficiary,
-							arbiter: arbiter
-								.map(|a| third_parties[usize::from(a) % third_parties.len()]),
-							milestones: amounts,
-							deadline: block + 1 + u64::from(deadline_in % 20),
-						}
-					} else {
-						Call::Create {
-							payer,
-							beneficiary: account(beneficiary),
-							arbiter: arbiter.map(account),
-							milestones: amounts,
-							// Spans a little into the past so past deadlines are exercised too.
-							deadline: (block + u64::from(deadline_in % 24)).saturating_sub(2),
-						}
-					}
-				},
-				Action::Release { who, id } => {
-					let id = u32::from(id) % span;
-					Call::Release { who: caller(who, model.parties.get(&id)), id }
-				},
-				Action::Refund { who, id } => {
-					let id = u32::from(id) % span;
-					Call::Refund { who: caller(who, model.parties.get(&id)), id }
-				},
-				Action::Cancel { who, id } => {
-					let id = u32::from(id) % span;
-					Call::Cancel { who: caller(who, model.parties.get(&id)), id }
-				},
+			let Some(call) = resolve_action::<T>(action, &model, block) else {
+				continue;
 			};
 
 			T::reset_events();
 			let before = snapshot::<T>();
 			IN_CALL.with(|c| c.set(true));
-			let outcome = catch_unwind(AssertUnwindSafe(|| match &call {
-				Call::Create { payer, beneficiary, arbiter, milestones, deadline } => {
-					T::create(*payer, *beneficiary, *arbiter, milestones.clone(), *deadline)
-				},
-				Call::Release { who, id } => T::release(*who, *id),
-				Call::Refund { who, id } => T::refund(*who, *id),
-				Call::Cancel { who, id } => T::cancel(*who, *id),
-			}));
+			let outcome = catch_unwind(AssertUnwindSafe(|| call.dispatch::<T>()));
 			IN_CALL.with(|c| c.set(false));
 			let outcome = match outcome {
 				Ok(outcome) => outcome,
@@ -717,16 +1132,9 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 				},
 			};
 			let after = snapshot::<T>();
-			let kind = match call {
-				Call::Create { .. } => 0,
-				Call::Release { .. } => 1,
-				Call::Refund { .. } => 2,
-				Call::Cancel { .. } => 3,
-			};
-			CALLS[kind][usize::from(outcome.is_err())].fetch_add(1, Ordering::Relaxed);
+			CALLS[call.index()][usize::from(outcome.is_err())].fetch_add(1, Ordering::Relaxed);
 
-			let expected = model.expect(&call, block, T::PARAMS, &before.balances);
-			match (outcome, expected) {
+			match (outcome, model.expect(&call, block, T::PARAMS, &before)) {
 				(Err(err), Ok(_)) => {
 					return Err(fail(
 						Kind::Rejected,
@@ -775,7 +1183,7 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 							),
 						));
 					}
-					model.commit(&call, T::PARAMS);
+					model.commit(&call, block, T::PARAMS);
 					if after.next_id != model.next_id {
 						return Err(fail(
 							Kind::IdMismatch,
@@ -783,14 +1191,9 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 						));
 					}
 					if after.escrows != model.escrows {
-						let left = after.escrows.keys().find(|id| !model.escrows.contains_key(id));
-						let kind = if left.is_some() {
-							Kind::ClosedEscrowLeft
-						} else {
-							Kind::StorageMismatch
-						};
+						let left = after.escrows.keys().any(|id| !model.escrows.contains_key(id));
 						return Err(fail(
-							kind,
+							if left { Kind::ClosedEscrowLeft } else { Kind::StorageMismatch },
 							format!(
 								"{call:?}\n  expected {:?}\n  actual   {:?}",
 								model.escrows, after.escrows

@@ -20,10 +20,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - name: Unit tests
-        run: cargo test -p pallet-escrow
-      - name: Benchmarks execute
-        run: cargo test -p pallet-escrow --features runtime-benchmarks
-      - name: Spec-oracle harness (fixed must pass, v0 findings must be rediscovered)
+        run: cargo test -p pallet-escrow -p pallet-escrow-v1
+      - name: Benchmarks execute, migration hooks build
+        run: cargo test -p pallet-escrow --features runtime-benchmarks,try-runtime
+      - name: Spec-oracle harness (v2 and v1 must pass, v0 findings must be rediscovered, migration keeps state)
         run: cargo test -p escrow-harness --release -- --nocapture --test-threads=1
         env:
           # Keep debug assertions on so arithmetic overflow panics instead of wrapping.
@@ -31,7 +31,7 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
           HARNESS_SEEDS: "20000"
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --features pallet-escrow/runtime-benchmarks -- -D warnings
+        run: cargo clippy --workspace --all-targets --features pallet-escrow/runtime-benchmarks,pallet-escrow/try-runtime -- -D warnings
 
   hunt-report:
     runs-on: ubuntu-latest
@@ -45,12 +45,14 @@ jobs:
             cargo run --release -q -p escrow-harness --example hunt -- v0 20000 | tee hunt-v0-checked.txt
       - name: v0 as a production runtime runs it (overflow wraps)
         run: cargo run --release -q -p escrow-harness --example hunt -- v0 20000 | tee hunt-v0-wrapping.txt
-      - name: fixed
-        run: cargo run --release -q -p escrow-harness --example hunt -- fixed 50000 | tee hunt-fixed.txt
+      - name: v1 (hold-based)
+        run: cargo run --release -q -p escrow-harness --example hunt -- v1 50000 | tee hunt-v1.txt
+      - name: v2 (the pallet)
+        run: cargo run --release -q -p escrow-harness --example hunt -- v2 50000 | tee hunt-v2.txt
       - name: Proofs of concept (release build, as a runtime is built)
         run: cargo run --release -q -p escrow-harness --example poc | tee poc.txt
       - run: |
-          { echo '```'; cat poc.txt; echo '```'; echo '```'; cat hunt-v0-checked.txt; echo '```'; echo '```'; head -40 hunt-v0-wrapping.txt; echo '```'; echo '```'; cat hunt-fixed.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo '```'; cat poc.txt; echo '```'; echo '```'; cat hunt-v0-checked.txt; echo '```'; echo '```'; head -40 hunt-v0-wrapping.txt; echo '```'; echo '```'; cat hunt-v1.txt; echo '```'; echo '```'; cat hunt-v2.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: hunt-reports
@@ -101,7 +103,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install --git https://github.com/sonofnos/frame-sentinel
-      - name: Hardened pallet must have no findings at medium or above
-        run: frame-sentinel pallets/escrow --fail-on medium
+      - name: Hardened pallets must have no findings at medium or above
+        run: |
+          frame-sentinel pallets/escrow --fail-on medium
+          frame-sentinel pallets/escrow-v1 --fail-on medium
       - name: Audit target (report only)
         run: frame-sentinel pallets/escrow-v0 --fail-on never | tee -a "$GITHUB_STEP_SUMMARY"
