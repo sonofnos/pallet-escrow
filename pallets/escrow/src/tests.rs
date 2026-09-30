@@ -1,4 +1,4 @@
-use crate::{mock::*, Error, Escrows, Event, HoldReason, NextEscrowId};
+use crate::{mock::*, Error, EscrowCount, Escrows, Event, HoldReason, NextEscrowId};
 use frame_support::{
 	assert_noop, assert_ok,
 	traits::{fungible::InspectHold, ConstU32},
@@ -291,6 +291,33 @@ fn payer_lock_cannot_block_a_payout() {
 		assert_ok!(Escrow::release(RuntimeOrigin::signed(ARBITER), id));
 		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
 		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 150);
+	});
+}
+
+#[test]
+fn escrow_count_follows_live_escrows() {
+	run(|| {
+		let a = open(&[100], None, 10);
+		let b = open(&[100, 50], None, 10);
+		assert_eq!(EscrowCount::<Test>::get(PAYER), 2);
+		assert_ok!(Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), a));
+		assert_eq!(EscrowCount::<Test>::get(PAYER), 1);
+		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), b));
+		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), b));
+		assert!(!EscrowCount::<Test>::contains_key(PAYER));
+	});
+}
+
+// `try_state` only sees payers with live escrows, so a hold that outlives the last one has to
+// be caught when that escrow closes.
+#[test]
+#[should_panic(expected = "hold left after the payer's last escrow closed")]
+fn hold_outliving_the_last_escrow_is_caught() {
+	use frame_support::traits::fungible::MutateHold;
+	new_test_ext().execute_with(|| {
+		let id = open(&[100], None, 10);
+		assert_ok!(Balances::hold(&HoldReason::Escrow.into(), &PAYER, 7));
+		let _ = Escrow::cancel(RuntimeOrigin::signed(BENEFICIARY), id);
 	});
 }
 

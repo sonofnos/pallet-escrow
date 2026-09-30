@@ -15,7 +15,11 @@
 //! ```text
 //! balance_on_hold(Escrow, payer)         == sum(remaining)  over the payer's live escrows
 //! balance_on_hold(StorageDeposit, payer) == sum(deposit)    over the payer's live escrows
+//! EscrowCount(payer)                     == number of the payer's live escrows
 //! ```
+//!
+//! `try_state` can only reach payers that still have escrows, so the other direction, nothing
+//! on hold once the count reaches zero, is checked when the last escrow closes.
 //!
 //! See `audit/REPORT.md` for the findings against the first draft (`pallet-escrow-v0`) that
 //! shaped this version.
@@ -127,6 +131,11 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type NextEscrowId<T: Config> = StorageValue<_, EscrowId, ValueQuery>;
 
+	/// Live escrows per payer. Absent means none, and then nothing may be on hold for them.
+	#[pallet::storage]
+	pub type EscrowCount<T: Config> =
+		StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
 	#[pallet::event]
 	#[pallet::generate_deposit(pub(super) fn deposit_event)]
 	pub enum Event<T: Config> {
@@ -228,6 +237,8 @@ pub mod pallet {
 
 			let id = NextEscrowId::<T>::get();
 			let next_id = id.checked_add(1).ok_or(Error::<T>::IdsExhausted)?;
+			let count =
+				EscrowCount::<T>::get(&payer).checked_add(1).ok_or(Error::<T>::Inconsistent)?;
 			let deposit = T::EscrowDeposit::get();
 
 			// Dispatchables are transactional: if the second hold fails, the first is reverted.
@@ -235,6 +246,7 @@ pub mod pallet {
 			T::Currency::hold(&HoldReason::StorageDeposit.into(), &payer, deposit)?;
 
 			NextEscrowId::<T>::put(next_id);
+			EscrowCount::<T>::insert(&payer, count);
 			Escrows::<T>::insert(
 				id,
 				EscrowInfo {
@@ -337,19 +349,38 @@ pub mod pallet {
 		/// `Precision::Exact` matters: the payer's hold is shared with their other escrows, so a
 		/// best-effort release of a stale amount would silently eat into them.
 		fn close(id: EscrowId, escrow: &EscrowInfo<T>) -> DispatchResult {
+			let payer = &escrow.payer;
 			T::Currency::release(
 				&HoldReason::Escrow.into(),
-				&escrow.payer,
+				payer,
 				escrow.remaining,
 				Precision::Exact,
 			)?;
 			T::Currency::release(
 				&HoldReason::StorageDeposit.into(),
-				&escrow.payer,
+				payer,
 				escrow.deposit,
 				Precision::Exact,
 			)?;
 			Escrows::<T>::remove(id);
+
+			let count =
+				EscrowCount::<T>::get(payer).checked_sub(1).ok_or(Error::<T>::Inconsistent)?;
+			if count > 0 {
+				EscrowCount::<T>::insert(payer, count);
+				return Ok(());
+			}
+			EscrowCount::<T>::remove(payer);
+			// `try_state` can only see payers with live escrows, so a hold that outlives the
+			// last one is checked here, the only place it could appear. Leaving it would lock
+			// the payer's funds with nothing able to release them.
+			for reason in [HoldReason::Escrow, HoldReason::StorageDeposit] {
+				let left = T::Currency::balance_on_hold(&reason.into(), payer);
+				if !left.is_zero() {
+					frame_support::defensive!("hold left after the payer's last escrow closed");
+					T::Currency::release(&reason.into(), payer, left, Precision::Exact)?;
+				}
+			}
 			Ok(())
 		}
 
@@ -358,7 +389,7 @@ pub mod pallet {
 		pub fn do_try_state() -> Result<(), sp_runtime::TryRuntimeError> {
 			use alloc::collections::btree_map::BTreeMap;
 
-			let mut expected: BTreeMap<T::AccountId, (BalanceOf<T>, BalanceOf<T>)> =
+			let mut expected: BTreeMap<T::AccountId, (BalanceOf<T>, BalanceOf<T>, u32)> =
 				BTreeMap::new();
 			let next_id = NextEscrowId::<T>::get();
 			for (id, escrow) in Escrows::<T>::iter() {
@@ -377,8 +408,19 @@ pub mod pallet {
 				let entry = expected.entry(escrow.payer.clone()).or_default();
 				entry.0 = entry.0.checked_add(&escrow.remaining).ok_or("hold sum overflows")?;
 				entry.1 = entry.1.checked_add(&escrow.deposit).ok_or("deposit sum overflows")?;
+				entry.2 += 1;
 			}
-			for (payer, (funds, deposits)) in expected {
+			for (payer, count) in EscrowCount::<T>::iter() {
+				ensure!(
+					expected.get(&payer).is_some_and(|e| e.2 == count),
+					"escrow count differs from the payer's live escrows"
+				);
+			}
+			for (payer, (funds, deposits, count)) in expected {
+				ensure!(
+					EscrowCount::<T>::get(&payer) == count,
+					"payer's live escrows are not counted"
+				);
 				ensure!(
 					T::Currency::balance_on_hold(&HoldReason::Escrow.into(), &payer) == funds,
 					"escrow hold differs from the payer's live escrows"
