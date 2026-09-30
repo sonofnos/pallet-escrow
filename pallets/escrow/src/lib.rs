@@ -270,6 +270,9 @@ pub mod pallet {
 			let remaining =
 				escrow.remaining.checked_sub(&amount).ok_or(Error::<T>::Inconsistent)?;
 
+			// `Force`: a lock on the payer applies to held funds too, so politely the payer could
+			// lock their balance and block every payout, the arbiter's included (ESC-11). The
+			// hold is already the beneficiary's claim.
 			T::Currency::transfer_on_hold(
 				&HoldReason::Escrow.into(),
 				&escrow.payer,
@@ -277,7 +280,7 @@ pub mod pallet {
 				amount,
 				Precision::Exact,
 				Restriction::Free,
-				Fortitude::Polite,
+				Fortitude::Force,
 			)?;
 
 			escrow.released = index.checked_add(1).ok_or(Error::<T>::Inconsistent)?;

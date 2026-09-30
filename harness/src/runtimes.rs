@@ -13,6 +13,48 @@ fn genesis_balances() -> Vec<(u64, u64)> {
 	(1..=ACCOUNTS).map(|who| (who, START_BALANCE)).collect()
 }
 
+/// What other pallets do to the same accounts. Identical for every target.
+mod environment {
+	#![allow(deprecated)] // `LockableCurrency` is what conviction voting still uses.
+
+	use frame_support::traits::{
+		fungible::Mutate, tokens::Preservation, LockIdentifier, LockableCurrency, WithdrawReasons,
+	};
+
+	const LOCK: LockIdentifier = *b"democrac";
+
+	pub trait Runtime:
+		frame_system::Config<AccountId = u64> + pallet_balances::Config<Balance = u64>
+	{
+	}
+	impl<T: frame_system::Config<AccountId = u64> + pallet_balances::Config<Balance = u64>> Runtime
+		for T
+	{
+	}
+
+	/// Only an account that exists can vote, or be locked for any other reason.
+	pub fn lock<T: Runtime>(who: u64, amount: u64) {
+		if frame_system::Pallet::<T>::account_exists(&who) {
+			pallet_balances::Pallet::<T>::set_lock(LOCK, &who, amount, WithdrawReasons::all());
+		}
+	}
+
+	pub fn unlock<T: Runtime>(who: u64) {
+		pallet_balances::Pallet::<T>::remove_lock(LOCK, &who);
+	}
+
+	pub fn transfer<T: Runtime>(from: u64, to: u64, amount: u64) {
+		let _ = frame_support::storage::with_storage_layer(|| {
+			<pallet_balances::Pallet<T> as Mutate<u64>>::transfer(
+				&from,
+				&to,
+				amount,
+				Preservation::Expendable,
+			)
+		});
+	}
+}
+
 pub mod fixed {
 	use super::*;
 	use frame_support::{
@@ -168,6 +210,15 @@ pub mod fixed {
 		fn reset_events() {
 			System::reset_events()
 		}
+		fn lock(who: u64, amount: u64) {
+			environment::lock::<Runtime>(who, amount)
+		}
+		fn unlock(who: u64) {
+			environment::unlock::<Runtime>(who)
+		}
+		fn transfer(from: u64, to: u64, amount: u64) {
+			environment::transfer::<Runtime>(from, to, amount)
+		}
 		fn try_state() -> Result<(), String> {
 			Escrow::do_try_state().map_err(|e| format!("{e:?}"))
 		}
@@ -299,5 +350,14 @@ pub mod v0 {
 			None
 		}
 		fn reset_events() {}
+		fn lock(who: u64, amount: u64) {
+			environment::lock::<Runtime>(who, amount)
+		}
+		fn unlock(who: u64) {
+			environment::unlock::<Runtime>(who)
+		}
+		fn transfer(from: u64, to: u64, amount: u64) {
+			environment::transfer::<Runtime>(from, to, amount)
+		}
 	}
 }

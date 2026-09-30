@@ -278,6 +278,22 @@ fn escrows_from_one_payer_are_accounted_separately() {
 	});
 }
 
+// ESC-11: a lock applies to the whole balance, held funds included. Transferring out of the hold
+// politely let a payer who locked their balance (a conviction vote, say) block every payout,
+// the arbiter's included, then refund after the deadline.
+#[test]
+#[allow(deprecated)]
+fn payer_lock_cannot_block_a_payout() {
+	use frame_support::traits::{LockableCurrency, WithdrawReasons};
+	run(|| {
+		let id = open(&[100, 50], Some(ARBITER), 10);
+		Balances::set_lock(*b"democrac", &PAYER, START_BALANCE, WithdrawReasons::all());
+		assert_ok!(Escrow::release(RuntimeOrigin::signed(ARBITER), id));
+		assert_ok!(Escrow::release(RuntimeOrigin::signed(PAYER), id));
+		assert_eq!(Balances::free_balance(BENEFICIARY), START_BALANCE + 150);
+	});
+}
+
 #[test]
 fn integrity_test_passes_for_mock_config() {
 	use frame_support::traits::Hooks;

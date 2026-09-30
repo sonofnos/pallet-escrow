@@ -55,7 +55,7 @@ pub fn coverage() -> String {
 		.join("\n")
 }
 
-use crate::runtimes::ACCOUNTS;
+use crate::runtimes::{ACCOUNTS, START_BALANCE};
 
 /// Limits the spec is checked against. They mirror each target's pallet configuration.
 #[derive(Clone, Copy, Debug)]
@@ -121,6 +121,11 @@ pub trait Target {
 	/// are not held to the spec.
 	fn events() -> Option<Vec<SpecEvent>>;
 	fn reset_events();
+	/// Set or replace the one lock another pallet keeps on `who`.
+	fn lock(who: u64, amount: u64);
+	fn unlock(who: u64);
+	/// A plain transfer outside the escrow pallet. It may fail; the spec does not care.
+	fn transfer(from: u64, to: u64, amount: u64);
 	/// The pallet's own invariant check, if it has one.
 	fn try_state() -> Result<(), String> {
 		Ok(())
@@ -232,6 +237,23 @@ pub enum Action {
 	Advance {
 		blocks: u8,
 	},
+	/// Another pallet locks part of an account's balance, as conviction voting does. A lock
+	/// applies to the whole balance, held funds included.
+	Lock {
+		who: u8,
+		amount: u16,
+	},
+	Unlock {
+		who: u8,
+	},
+	/// An account pays someone outside any escrow: an exact amount, everything down to the
+	/// existential deposit, or everything.
+	Spend {
+		who: u8,
+		to: u8,
+		amount: u16,
+		mode: u8,
+	},
 }
 
 fn account(index: u8) -> u64 {
@@ -300,6 +322,9 @@ impl Violation {
 			Action::Refund { .. } => "refund",
 			Action::Cancel { .. } => "cancel",
 			Action::Advance { .. } => "advance",
+			Action::Lock { .. } => "lock",
+			Action::Unlock { .. } => "unlock",
+			Action::Spend { .. } => "spend",
 		};
 		match &self.kind {
 			Kind::Panic(msg) if msg.contains("overflow") => {
@@ -599,6 +624,24 @@ pub fn run<T: Target>(actions: &[Action]) -> Result<(), Violation> {
 			let call = match action.clone() {
 				Action::Advance { blocks } => {
 					T::set_block(block + u64::from(blocks));
+					continue;
+				},
+				Action::Lock { who, amount } => {
+					T::lock(account(who), u64::from(amount) % (2 * START_BALANCE));
+					continue;
+				},
+				Action::Unlock { who } => {
+					T::unlock(account(who));
+					continue;
+				},
+				Action::Spend { who, to, amount, mode } => {
+					let (from, free) = (account(who), T::free(account(who)));
+					let amount = match mode % 3 {
+						0 => u64::from(amount) % (free + 1),
+						1 => free.saturating_sub(T::PARAMS.existential_deposit),
+						_ => free,
+					};
+					T::transfer(from, other_account(from, to), amount);
 					continue;
 				},
 				Action::Create { payer, beneficiary, arbiter, milestones, deadline_in, shape } => {
