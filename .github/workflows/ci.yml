@@ -32,6 +32,9 @@ jobs:
           HARNESS_SEEDS: "20000"
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features pallet-escrow/runtime-benchmarks,pallet-escrow/try-runtime -- -D warnings
+        env:
+          # Type-check the benchmark runtime natively; the `weights` job builds its wasm.
+          SKIP_WASM_BUILD: 1
 
   hunt-report:
     runs-on: ubuntu-latest
@@ -85,6 +88,31 @@ jobs:
           name: fuzz-artifacts
           path: fuzz/artifacts
 
+  weights:
+    runs-on: ubuntu-latest
+    env:
+      BENCHER: https://github.com/paritytech/polkadot-sdk/releases/download/polkadot-stable2606-2/frame-omni-bencher
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32v1-none
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - name: Benchmark runtime (wasm)
+        run: cargo build --release -p escrow-bench-runtime --features runtime-benchmarks
+      - name: frame-omni-bencher from the stable2606 release
+        run: |
+          curl -sSfLO "$BENCHER" && curl -sSfLO "$BENCHER.sha256"
+          sha256sum -c frame-omni-bencher.sha256 && chmod +x frame-omni-bencher
+      - name: Every benchmark runs; weights regenerated on this runner
+        run: |
+          ./frame-omni-bencher v1 benchmark pallet             --runtime target/release/wbuild/escrow-bench-runtime/escrow_bench_runtime.compact.compressed.wasm             --pallet pallet_escrow --extrinsic '*' --steps 50 --repeat 20             --template .maintain/frame-weight-template.hbs --header .maintain/weights-header.txt             --output weights.rs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weights
+          path: weights.rs
+
   no-std:
     runs-on: ubuntu-latest
     steps:
@@ -94,8 +122,8 @@ jobs:
           targets: wasm32v1-none
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - name: Pallet builds for the runtime target without std
-        run: cargo check -p pallet-escrow --no-default-features --target wasm32v1-none
+      - name: Pallets build for the runtime target without std
+        run: cargo check -p pallet-escrow -p pallet-escrow-v1 --no-default-features --target wasm32v1-none
 
   frame-sentinel:
     runs-on: ubuntu-latest

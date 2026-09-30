@@ -1,0 +1,60 @@
+[package]
+name = "escrow-bench-runtime"
+version = "0.1.0"
+description = "Minimal runtime that `pallet-escrow` is benchmarked in with frame-omni-bencher."
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+codec = { workspace = true }
+scale-info = { workspace = true }
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+frame-executive = { workspace = true }
+frame-benchmarking = { workspace = true, optional = true }
+pallet-balances = { workspace = true }
+pallet-escrow = { workspace = true }
+sp-api = { workspace = true }
+sp-block-builder = { workspace = true }
+sp-core = { workspace = true }
+sp-genesis-builder = { workspace = true }
+sp-inherents = { workspace = true }
+sp-runtime = { workspace = true }
+sp-storage = { workspace = true }
+sp-version = { workspace = true }
+
+[build-dependencies]
+substrate-wasm-builder = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = [
+	"codec/std",
+	"scale-info/std",
+	"frame-support/std",
+	"frame-system/std",
+	"frame-executive/std",
+	"frame-benchmarking?/std",
+	"pallet-balances/std",
+	"pallet-escrow/std",
+	"sp-api/std",
+	"sp-block-builder/std",
+	"sp-core/std",
+	"sp-genesis-builder/std",
+	"sp-inherents/std",
+	"sp-runtime/std",
+	"sp-storage/std",
+	"sp-version/std",
+	"substrate-wasm-builder",
+]
+runtime-benchmarks = [
+	"frame-benchmarking/runtime-benchmarks",
+	"frame-support/runtime-benchmarks",
+	"frame-system/runtime-benchmarks",
+	"pallet-balances/runtime-benchmarks",
+	"pallet-escrow/runtime-benchmarks",
+	"sp-runtime/runtime-benchmarks",
+]
